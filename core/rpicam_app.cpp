@@ -2,46 +2,74 @@
 /*
  * Copyright (C) 2021, Raspberry Pi (Trading) Ltd.
  *
- * libcamera_app.cpp - base class for libcamera apps.
+ * rpicam_app.cpp - base class for libcamera apps.
  */
 
 #include "preview/preview.hpp"
 
 #include "core/frame_info.hpp"
-#include "core/libcamera_app.hpp"
+#include "core/rpicam_app.hpp"
 #include "core/options.hpp"
 
 #include <cmath>
 #include <fcntl.h>
+#include <stdlib.h>
 
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 
+#include <linux/dma-buf.h>
 #include <linux/videodev2.h>
 
-#include "cinepi/utils.hpp"
+#include <libcamera/base/shared_fd.h>
+#include <libcamera/orientation.h>
 
-unsigned int LibcameraApp::verbosity = 2;
+unsigned int RPiCamApp::verbosity = 1;
 
-// If we definitely appear to be running the old camera stack, complain and give up.
-// Everything else, Pi or not, we let through.
-
-static void check_camera_stack()
+enum class Platform
 {
-	int fd = open("/dev/video0", O_RDWR, 0);
-	if (fd < 0)
-		return;
+	MISSING,
+	UNKNOWN,
+	LEGACY,
+	VC4,
+	PISP,
+};
 
-	v4l2_capability caps;
-	unsigned long request = VIDIOC_QUERYCAP;
+Platform get_platform()
+{
+	bool unknown = false;
+	for (unsigned int device_num = 0; device_num < 5; device_num++)
+	{
+		char device_name[16];
+		snprintf(device_name, sizeof(device_name), "/dev/video%u", device_num);
+		int fd = open(device_name, O_RDWR, 0);
+		if (fd < 0)
+			continue;
 
-	int ret = ioctl(fd, request, &caps);
-	close(fd);
+		v4l2_capability caps;
+		unsigned long request = VIDIOC_QUERYCAP;
 
-	if (ret < 0 || strcmp((char *)caps.driver, "bm2835 mmal"))
-		return;
+		int ret = ioctl(fd, request, &caps);
+		close(fd);
 
-	fprintf(stderr, "ERROR: the system appears to be configured for the legacy camera stack\n");
-	exit(-1);
+		if (ret)
+			continue;
+
+		// We are not concerned with UVC devices for now.
+		if (!strncmp((char *)caps.driver, "uvcvideo", sizeof(caps.card)))
+			continue;
+
+		if (!strncmp((char *)caps.card, "unicam", sizeof(caps.card)))
+			return Platform::VC4;
+		else if (!strncmp((char *)caps.card, "rp1-cfe", sizeof(caps.card)))
+			return Platform::PISP;
+		else if (!strncmp((char *)caps.card, "bm2835 mmal", sizeof(caps.card)))
+			return Platform::LEGACY;
+		else
+			unknown = true;
+	}
+
+	return unknown ? Platform::UNKNOWN : Platform::MISSING;
 }
 
 static libcamera::PixelFormat mode_to_pixel_format(Mode const &mode)
@@ -66,19 +94,59 @@ static libcamera::PixelFormat mode_to_pixel_format(Mode const &mode)
 	return libcamera::formats::SBGGR12_CSI2P;
 }
 
-LibcameraApp::LibcameraApp(std::unique_ptr<Options> opts)
+static void set_pipeline_configuration(Platform platform)
+{
+	// Respect any pre-existing value in the environment variable.
+	char const *existing_config = getenv("LIBCAMERA_RPI_CONFIG_FILE");
+	if (existing_config && existing_config[0])
+		return;
+
+	// Otherwise point it at whichever of these we find first (if any) for the given platform.
+	static const std::vector<std::pair<Platform, std::string>> config_files = {
+		{ Platform::VC4, "/usr/local/share/libcamera/pipeline/rpi/vc4/rpi_apps.yaml" },
+		{ Platform::VC4, "/usr/share/libcamera/pipeline/rpi/vc4/rpi_apps.yaml" },
+	};
+
+	for (auto &config_file : config_files)
+	{
+		struct stat info;
+		if (config_file.first == platform && stat(config_file.second.c_str(), &info) == 0)
+		{
+			setenv("LIBCAMERA_RPI_CONFIG_FILE", config_file.second.c_str(), 1);
+			break;
+		}
+	}
+}
+
+RPiCamApp::RPiCamApp(std::unique_ptr<Options> opts)
 	: options_(std::move(opts)), controls_(controls::controls), post_processor_(this)
 {
-	check_camera_stack();
+	Platform platform = get_platform();
+	if (platform == Platform::LEGACY)
+	{
+		// If we definitely appear to be running the old camera stack, complain and give up.
+		fprintf(stderr, "ERROR: the system appears to be configured for the legacy camera stack\n");
+		exit(-1);
+	}
+	else if (platform == Platform::UNKNOWN)
+	{
+		fprintf(stderr, "ERROR: rpicam-apps currently only supports the Raspberry Pi platforms.\n"
+						"Contributions for other platforms are welcome at https://github.com/raspberrypi/rpicam-apps.\n");
+		exit(-1);
+	}
 
 	if (!options_)
 		options_ = std::make_unique<Options>();
+
+	options_->SetApp(this);
+
+	set_pipeline_configuration(platform);
 }
 
-LibcameraApp::~LibcameraApp()
+RPiCamApp::~RPiCamApp()
 {
 	if (!options_->help)
-		LOG(2, "Closing Libcamera application"
+		LOG(2, "Closing RPiCam application"
 				   << "(frames displayed " << preview_frames_displayed_ << ", dropped " << preview_frames_dropped_
 				   << ")");
 	StopCamera();
@@ -86,38 +154,41 @@ LibcameraApp::~LibcameraApp()
 	CloseCamera();
 }
 
-std::string const &LibcameraApp::CameraId() const
+void RPiCamApp::initCameraManager()
 {
-	return camera_->id();
-}
-
-// std::string LibcameraApp::CameraModel() const
-// {
-// 	auto model = camera_->properties().get(properties::Model);
-// 	return model ? *model : camera_->id();
-// }
-
-void LibcameraApp::OpenCamera()
-{
-	// Make a preview window.
-	preview_ = std::unique_ptr<Preview>(make_preview(options_.get()));
-	preview_->SetDoneCallback(std::bind(&LibcameraApp::previewDoneCallback, this, std::placeholders::_1));
-
-	LOG(2, "Opening camera...");
-
+	camera_manager_.reset();
 	camera_manager_ = std::make_unique<CameraManager>();
 	int ret = camera_manager_->start();
 	if (ret)
 		throw std::runtime_error("camera manager failed to start, code " + std::to_string(-ret));
+}
 
-	std::vector<std::shared_ptr<libcamera::Camera>> cameras = camera_manager_->cameras();
-	// Do not show USB webcams as these are not supported in libcamera-apps!
-	auto rem = std::remove_if(cameras.begin(), cameras.end(),
-							  [](auto &cam) { return cam->id().find("/usb") != std::string::npos; });
-	cameras.erase(rem, cameras.end());
+std::string const &RPiCamApp::CameraId() const
+{
+	return camera_->id();
+}
 
+std::string RPiCamApp::CameraModel() const
+{
+	auto model = camera_->properties().get(properties::Model);
+	return model ? *model : camera_->id();
+}
+
+void RPiCamApp::OpenCamera()
+{
+	// Make a preview window.
+	preview_ = std::unique_ptr<Preview>(make_preview(options_.get()));
+	preview_->SetDoneCallback(std::bind(&RPiCamApp::previewDoneCallback, this, std::placeholders::_1));
+
+	LOG(2, "Opening camera...");
+
+	if (!camera_manager_)
+		initCameraManager();
+
+	std::vector<std::shared_ptr<libcamera::Camera>> cameras = GetCameras();
 	if (cameras.size() == 0)
 		throw std::runtime_error("no cameras available");
+
 	if (options_->camera >= cameras.size())
 		throw std::runtime_error("selected camera is not available");
 
@@ -138,34 +209,44 @@ void LibcameraApp::OpenCamera()
 	post_processor_.SetCallback(
 		[this](CompletedRequestPtr &r) { this->msg_queue_.Post(Msg(MsgType::RequestComplete, std::move(r))); });
 
-	if (options_->framerate)
+	// We're going to make a list of all the available sensor modes, but we only populate
+	// the framerate field if the user has requested a framerate (as this requires us actually
+	// to configure the sensor, which is otherwise best avoided).
+
+	std::unique_ptr<CameraConfiguration> config = camera_->generateConfiguration({ libcamera::StreamRole::Raw });
+	const libcamera::StreamFormats &formats = config->at(0).formats();
+
+	// Suppress log messages when enumerating camera modes.
+	libcamera::logSetLevel("RPI", "ERROR");
+	libcamera::logSetLevel("Camera", "ERROR");
+
+	for (const auto &pix : formats.pixelformats())
 	{
-		std::unique_ptr<CameraConfiguration> config = camera_->generateConfiguration({ libcamera::StreamRole::Raw });
-		const libcamera::StreamFormats &formats = config->at(0).formats();
-
-		// Suppress log messages when enumerating camera modes.
-		libcamera::logSetLevel("RPI", "ERROR");
-		libcamera::logSetLevel("Camera", "ERROR");
-
-		for (const auto &pix : formats.pixelformats())
+		for (const auto &size : formats.sizes(pix))
 		{
-			for (const auto &size : formats.sizes(pix))
+			double framerate = 0;
+			if (options_->framerate)
 			{
+				SensorMode sensorMode(size, pix, 0);
 				config->at(0).size = size;
 				config->at(0).pixelFormat = pix;
+				config->sensorConfig = libcamera::SensorConfiguration();
+				config->sensorConfig->outputSize = size;
+				config->sensorConfig->bitDepth = sensorMode.depth();
 				config->validate();
 				camera_->configure(config.get());
 				auto fd_ctrl = camera_->controls().find(&controls::FrameDurationLimits);
-				sensor_modes_.emplace_back(size, pix, 1.0e6 / fd_ctrl->second.min().get<int64_t>());
+				framerate = 1.0e6 / fd_ctrl->second.min().get<int64_t>();
 			}
+			sensor_modes_.emplace_back(size, pix, framerate);
 		}
-
-		libcamera::logSetLevel("RPI", "INFO");
-		libcamera::logSetLevel("Camera", "INFO");
 	}
+
+	libcamera::logSetLevel("RPI", "INFO");
+	libcamera::logSetLevel("Camera", "INFO");
 }
 
-void LibcameraApp::CloseCamera()
+void RPiCamApp::CloseCamera()
 {
 	preview_.reset();
 
@@ -181,7 +262,7 @@ void LibcameraApp::CloseCamera()
 		LOG(2, "Camera closed");
 }
 
-Mode LibcameraApp::selectModeForFramerate(const libcamera::Size &req, double fps)
+Mode RPiCamApp::selectMode(const Mode &mode) const
 {
 	auto scoreFormat = [](double desired, double actual) -> double
 	{
@@ -203,46 +284,45 @@ Mode LibcameraApp::selectModeForFramerate(const libcamera::Size &req, double fps
 	double best_score = std::numeric_limits<double>::max(), score;
 	SensorMode best_mode;
 
-	LOG(1, "Mode selection:");
-	for (const auto &mode : sensor_modes_)
+	LOG(1, "Mode selection for " << mode.ToString());
+	for (const auto &sensor_mode : sensor_modes_)
 	{
-		double reqAr = static_cast<double>(req.width) / req.height;
-		double fmtAr = static_cast<double>(mode.size.width) / mode.size.height;
+		double reqAr = static_cast<double>(mode.width) / mode.height;
+		double fmtAr = static_cast<double>(sensor_mode.size.width) / sensor_mode.size.height;
 
 		// Similar scoring mechanism that our pipeline handler does internally.
-		score = scoreFormat(req.width, mode.size.width);
-		score += scoreFormat(req.height, mode.size.height);
+		score = scoreFormat(mode.width, sensor_mode.size.width);
+		score += scoreFormat(mode.height, sensor_mode.size.height);
 		score += penalty_AR * scoreFormat(reqAr, fmtAr);
-		score += penalty_FPS * std::abs(fps - std::min(mode.fps, fps));
-		score += penalty_BD * (16 - mode.depth());
+		if (mode.framerate)
+			score += penalty_FPS * std::abs(mode.framerate - std::min(sensor_mode.fps, mode.framerate));
+		score += penalty_BD * abs((int)(mode.bit_depth - sensor_mode.depth()));
 
 		if (score <= best_score)
 		{
 			best_score = score;
-			best_mode.size = mode.size;
-			best_mode.format = mode.format;
+			best_mode.size = sensor_mode.size;
+			best_mode.format = sensor_mode.format;
 		}
 
-		LOG(1, "    " << mode.format.toString() << " " << mode.size.toString() << " - Score: " << score);
+		LOG(1, "    " << sensor_mode.ToString() << " - Score: " << score);
 	}
 
-	return { best_mode.size.width, best_mode.size.height, best_mode.depth(), true };
+	return { best_mode.size.width, best_mode.size.height, best_mode.depth(), mode.packed };
 }
 
-void LibcameraApp::ConfigureViewfinder()
+void RPiCamApp::ConfigureViewfinder()
 {
 	LOG(2, "Configuring viewfinder...");
 
-	bool select_mode = options_->framerate && options_->framerate.value() && options_->viewfinder_mode_string.empty();
 	int lores_stream_num = 0, raw_stream_num = 0;
 	bool have_lores_stream = options_->lores_width && options_->lores_height;
-	bool have_raw_stream = options_->viewfinder_mode.bit_depth || select_mode;
 
 	StreamRoles stream_roles = { StreamRole::Viewfinder };
 	int stream_num = 1;
 	if (have_lores_stream)
 		stream_roles.push_back(StreamRole::Viewfinder), lores_stream_num = stream_num++;
-	if (have_raw_stream)
+	if (!options_->no_raw)
 		stream_roles.push_back(StreamRole::Raw), raw_stream_num = stream_num++;
 
 	configuration_ = camera_->generateConfiguration(stream_roles);
@@ -293,17 +373,20 @@ void LibcameraApp::ConfigureViewfinder()
 		configuration_->at(lores_stream_num).bufferCount = configuration_->at(0).bufferCount;
 	}
 
-	if (select_mode)
-		options_->viewfinder_mode = selectModeForFramerate(size, options_->framerate.value());
-
-	if (have_raw_stream)
+	if (!options_->no_raw)
 	{
+		options_->viewfinder_mode.update(size, options_->framerate);
+		options_->viewfinder_mode = selectMode(options_->viewfinder_mode);
+
 		configuration_->at(raw_stream_num).size = options_->viewfinder_mode.Size();
 		configuration_->at(raw_stream_num).pixelFormat = mode_to_pixel_format(options_->viewfinder_mode);
 		configuration_->at(raw_stream_num).bufferCount = configuration_->at(0).bufferCount;
+		configuration_->sensorConfig = libcamera::SensorConfiguration();
+		configuration_->sensorConfig->outputSize = options_->viewfinder_mode.Size();
+		configuration_->sensorConfig->bitDepth = options_->viewfinder_mode.bit_depth;
 	}
 
-	configuration_->transform = options_->transform;
+	configuration_->orientation = libcamera::Orientation::Rotate0 * options_->transform;
 
 	post_processor_.AdjustConfig("viewfinder", &configuration_->at(0));
 
@@ -313,7 +396,7 @@ void LibcameraApp::ConfigureViewfinder()
 	streams_["viewfinder"] = configuration_->at(0).stream();
 	if (have_lores_stream)
 		streams_["lores"] = configuration_->at(lores_stream_num).stream();
-	if (have_raw_stream)
+	if (!options_->no_raw)
 		streams_["raw"] = configuration_->at(raw_stream_num).stream();
 
 	post_processor_.Configure();
@@ -321,13 +404,111 @@ void LibcameraApp::ConfigureViewfinder()
 	LOG(2, "Viewfinder setup complete");
 }
 
-void LibcameraApp::ConfigureStill(unsigned int flags)
+void RPiCamApp::ConfigureZsl(unsigned int still_flags)
+{
+	LOG(2, "Configuring ZSL...");
+
+	StreamRoles stream_roles = { StreamRole::StillCapture, StreamRole::Viewfinder };
+	if (!options_->no_raw)
+		stream_roles.push_back(StreamRole::Raw);
+
+	configuration_ = camera_->generateConfiguration(stream_roles);
+	if (!configuration_)
+		throw std::runtime_error("failed to generate viewfinder configuration");
+
+	// Now we get to override any of the default settings from the options_->
+	if (still_flags & FLAG_STILL_BGR)
+		configuration_->at(0).pixelFormat = libcamera::formats::BGR888;
+	else if (still_flags & FLAG_STILL_RGB)
+		configuration_->at(0).pixelFormat = libcamera::formats::RGB888;
+	else
+		configuration_->at(0).pixelFormat = libcamera::formats::YUV420;
+	if (options_->buffer_count > 0)
+		configuration_->at(0).bufferCount = options_->buffer_count;
+	else
+		// Use the viewfinder stream buffer count if none has been provided
+		configuration_->at(0).bufferCount = configuration_->at(1).bufferCount;
+	if (options_->width)
+		configuration_->at(0).size.width = options_->width;
+	if (options_->height)
+		configuration_->at(0).size.height = options_->height;
+	configuration_->at(0).colorSpace = libcamera::ColorSpace::Sycc;
+	configuration_->orientation = libcamera::Orientation::Rotate0 * options_->transform;
+
+	post_processor_.AdjustConfig("still", &configuration_->at(0));
+
+	if (!options_->no_raw)
+	{
+		options_->mode.update(configuration_->at(0).size, options_->framerate);
+		options_->mode = selectMode(options_->mode);
+
+		configuration_->at(2).size = options_->mode.Size();
+		configuration_->at(2).pixelFormat = mode_to_pixel_format(options_->mode);
+		configuration_->sensorConfig = libcamera::SensorConfiguration();
+		configuration_->sensorConfig->outputSize = options_->mode.Size();
+		configuration_->sensorConfig->bitDepth = options_->mode.bit_depth;
+		configuration_->at(2).bufferCount = configuration_->at(0).bufferCount;
+	}
+
+	Size size(1280, 960);
+	auto area = camera_->properties().get(properties::PixelArrayActiveAreas);
+	if (options_->viewfinder_width && options_->viewfinder_height)
+		size = Size(options_->viewfinder_width, options_->viewfinder_height);
+	else if (area)
+	{
+		// The idea here is that most sensors will have a 2x2 binned mode that
+		// we can pick up. If it doesn't, well, you can always specify the size
+		// you want exactly with the viewfinder_width/height options_->
+		size = (*area)[0].size() / 2;
+		// If width and height were given, we might be switching to capture
+		// afterwards - so try to match the field of view.
+		if (options_->width && options_->height)
+			size = size.boundedToAspectRatio(Size(options_->width, options_->height));
+		size.alignDownTo(2, 2); // YUV420 will want to be even
+		LOG(2, "Viewfinder size chosen is " << size.toString());
+	}
+
+	// Finally trim the image size to the largest that the preview can handle.
+	Size max_size;
+	preview_->MaxImageSize(max_size.width, max_size.height);
+	if (max_size.width && max_size.height)
+	{
+		size.boundTo(max_size.boundedToAspectRatio(size)).alignDownTo(2, 2);
+		LOG(2, "Final viewfinder size is " << size.toString());
+	}
+
+	// Now we get to override any of the default settings from the options_->
+	configuration_->at(1).pixelFormat = libcamera::formats::YUV420;
+	configuration_->at(1).size = size;
+	configuration_->at(1).bufferCount = configuration_->at(0).bufferCount;
+
+	configuration_->orientation = libcamera::Orientation::Rotate0 * options_->transform;
+
+	post_processor_.AdjustConfig("viewfinder", &configuration_->at(1));
+
+	configureDenoise(options_->denoise == "auto" ? "cdn_hq" : options_->denoise);
+	setupCapture();
+
+	streams_["still"] = configuration_->at(0).stream();
+	streams_["viewfinder"] = configuration_->at(1).stream();
+	if (!options_->no_raw)
+		streams_["raw"] = configuration_->at(2).stream();
+
+	post_processor_.Configure();
+
+	LOG(2, "ZSL setup complete");
+}
+
+void RPiCamApp::ConfigureStill(unsigned int flags)
 {
 	LOG(2, "Configuring still capture...");
 
-	// Always request a raw stream as this forces the full resolution capture mode.
+	// Always request a raw stream as this forces the full resolution capture mode,
+	// unless the no-raw option is used.
 	// (options_->mode can override the choice of camera mode, however.)
-	StreamRoles stream_roles = { StreamRole::StillCapture, StreamRole::Raw };
+	StreamRoles stream_roles = { StreamRole::StillCapture };
+	if (!options_->no_raw)
+		stream_roles.push_back(StreamRole::Raw);
 	configuration_ = camera_->generateConfiguration(stream_roles);
 	if (!configuration_)
 		throw std::runtime_error("failed to generate still capture configuration");
@@ -350,42 +531,44 @@ void LibcameraApp::ConfigureStill(unsigned int flags)
 	if (options_->height)
 		configuration_->at(0).size.height = options_->height;
 	configuration_->at(0).colorSpace = libcamera::ColorSpace::Sycc;
-	configuration_->transform = options_->transform;
+	configuration_->orientation = libcamera::Orientation::Rotate0 * options_->transform;
 
 	post_processor_.AdjustConfig("still", &configuration_->at(0));
 
-	if (options_->mode.bit_depth)
+	if (!options_->no_raw)
 	{
+		options_->mode.update(configuration_->at(0).size, options_->framerate);
+		options_->mode = selectMode(options_->mode);
+
 		configuration_->at(1).size = options_->mode.Size();
 		configuration_->at(1).pixelFormat = mode_to_pixel_format(options_->mode);
+		configuration_->sensorConfig = libcamera::SensorConfiguration();
+		configuration_->sensorConfig->outputSize = options_->mode.Size();
+		configuration_->sensorConfig->bitDepth = options_->mode.bit_depth;
+		configuration_->at(1).bufferCount = configuration_->at(0).bufferCount;
 	}
-	configuration_->at(1).bufferCount = configuration_->at(0).bufferCount;
 
 	configureDenoise(options_->denoise == "auto" ? "cdn_hq" : options_->denoise);
 	setupCapture();
 
 	streams_["still"] = configuration_->at(0).stream();
-	streams_["raw"] = configuration_->at(1).stream();
+	if (!options_->no_raw)
+		streams_["raw"] = configuration_->at(1).stream();
 
 	post_processor_.Configure();
 
 	LOG(2, "Still capture setup complete");
 }
 
-void LibcameraApp::ConfigureVideo(unsigned int flags)
+void RPiCamApp::ConfigureVideo(unsigned int flags, uint8_t thumbnailFactor)
 {
 	LOG(2, "Configuring video...");
 
-	bool select_mode = options_->framerate && options_->framerate.value() && options_->mode_string.empty();
-	bool have_raw_stream = (flags & FLAG_VIDEO_RAW) || options_->mode.bit_depth || select_mode;
 	bool have_lores_stream = options_->lores_width && options_->lores_height;
 	StreamRoles stream_roles = { StreamRole::VideoRecording };
 	int lores_index = 1;
-	if (have_raw_stream)
-	{
-		stream_roles.push_back(StreamRole::Raw);
-		lores_index = 2;
-	}
+	if (!options_->no_raw)
+		stream_roles.push_back(StreamRole::Raw), lores_index++;
 	if (have_lores_stream)
 		stream_roles.push_back(StreamRole::Viewfinder);
 	configuration_ = camera_->generateConfiguration(stream_roles);
@@ -394,7 +577,7 @@ void LibcameraApp::ConfigureVideo(unsigned int flags)
 
 	// Now we get to override any of the default settings from the options_->
 	StreamConfiguration &cfg = configuration_->at(0);
-	cfg.pixelFormat = libcamera::formats::YUV420;
+	cfg.pixelFormat = libcamera::formats::YUV420; //YUYV XRGB8888
 	cfg.bufferCount = 6; // 6 buffers is better than 4
 	if (options_->buffer_count > 0)
 		cfg.bufferCount = options_->buffer_count;
@@ -408,53 +591,45 @@ void LibcameraApp::ConfigureVideo(unsigned int flags)
 		cfg.colorSpace = libcamera::ColorSpace::Rec709;
 	else
 		cfg.colorSpace = libcamera::ColorSpace::Smpte170m;
-	configuration_->transform = options_->transform;
+	configuration_->orientation = libcamera::Orientation::Rotate0 * options_->transform;
 
 	post_processor_.AdjustConfig("video", &configuration_->at(0));
 
-	if (select_mode)
-		options_->mode = selectModeForFramerate(cfg.size, options_->framerate.value());
-
-	if (have_raw_stream)
+	if (!options_->no_raw)
 	{
-		if (options_->mode.bit_depth)
-		{
-			configuration_->at(1).size = options_->mode.Size();
-			configuration_->at(1).pixelFormat = mode_to_pixel_format(options_->mode);
-		}
-		else if (!options_->rawfull)
-			configuration_->at(1).size = configuration_->at(0).size;
-		configuration_->at(1).bufferCount = configuration_->at(0).bufferCount;
+		options_->mode.update(configuration_->at(0).size, options_->framerate);
+		options_->mode = selectMode(options_->mode);
 
-		if(options_->compression == CompressionType::LOSSLESS){
-			std::string pxInfo = configuration_->at(1).pixelFormat.toString();
-			// std::cout << pxInfo << std::endl;
-			if(pxInfo.find("10") != std::string::npos){
-				configuration_->at(1).pixelFormat = libcamera::formats::SBGGR12;
-			} else if(pxInfo.find("12") != std::string::npos){
-				configuration_->at(1).pixelFormat = libcamera::formats::SBGGR10;
-			}
-		}
+		configuration_->at(1).size = options_->mode.Size();
+		configuration_->at(1).pixelFormat = mode_to_pixel_format(options_->mode);
+		configuration_->sensorConfig = libcamera::SensorConfiguration();
+		configuration_->sensorConfig->outputSize = options_->mode.Size();
+		configuration_->sensorConfig->bitDepth = options_->mode.bit_depth;
+		configuration_->at(1).bufferCount = configuration_->at(0).bufferCount;
 	}
+
 	if (have_lores_stream)
 	{
-		// Size lores_size(options_->lores_width, options_->lores_height);
-		Size lores_size(options_->width >> 3, options_->height >> 3);
+		Size lores_size(options_->lores_width, options_->lores_height);
 		lores_size.alignDownTo(2, 2);
 		if (lores_size.width > configuration_->at(0).size.width ||
 			lores_size.height > configuration_->at(0).size.height)
 			throw std::runtime_error("Low res image larger than video");
-		configuration_->at(lores_index).pixelFormat = libcamera::formats::NV12;
+		configuration_->at(lores_index).pixelFormat = libcamera::formats::YUV420;
 		configuration_->at(lores_index).size = lores_size;
 		configuration_->at(lores_index).bufferCount = configuration_->at(0).bufferCount;
 	}
-	configuration_->transform = options_->transform;
+	configuration_->orientation = libcamera::Orientation::Rotate0 * options_->transform;
+
+	Size preview_size(configuration_->at(1).size.width >> thumbnailFactor, configuration_->at(1).size.height >> thumbnailFactor);
+	preview_size.alignDownTo(2, 2);
+	configuration_->at(0).size = preview_size;
 
 	configureDenoise(options_->denoise == "auto" ? "cdn_fast" : options_->denoise);
 	setupCapture();
 
 	streams_["video"] = configuration_->at(0).stream();
-	if (have_raw_stream)
+	if (!options_->no_raw)
 		streams_["raw"] = configuration_->at(1).stream();
 	if (have_lores_stream)
 		streams_["lores"] = configuration_->at(lores_index).stream();
@@ -464,7 +639,7 @@ void LibcameraApp::ConfigureVideo(unsigned int flags)
 	LOG(2, "Video setup complete");
 }
 
-void LibcameraApp::Teardown()
+void RPiCamApp::Teardown()
 {
 	stopPreview();
 
@@ -482,9 +657,6 @@ void LibcameraApp::Teardown()
 	}
 	mapped_buffers_.clear();
 
-	delete allocator_;
-	allocator_ = nullptr;
-
 	configuration_.reset();
 
 	frame_buffers_.clear();
@@ -492,7 +664,7 @@ void LibcameraApp::Teardown()
 	streams_.clear();
 }
 
-void LibcameraApp::StartCamera()
+void RPiCamApp::StartCamera()
 {
 	// This makes all the Request objects that we shall need.
 	makeRequests();
@@ -547,7 +719,7 @@ void LibcameraApp::StartCamera()
 	}
 
 	if (!controls_.get(controls::ExposureTime) && options_->shutter)
-		controls_.set(controls::ExposureTime, options_->shutter);
+		controls_.set(controls::ExposureTime, options_->shutter.get<std::chrono::microseconds>());
 	if (!controls_.get(controls::AnalogueGain) && options_->gain)
 		controls_.set(controls::AnalogueGain, options_->gain);
 	if (!controls_.get(controls::AeMeteringMode))
@@ -558,8 +730,6 @@ void LibcameraApp::StartCamera()
 		controls_.set(controls::ExposureValue, options_->ev);
 	if (!controls_.get(controls::AwbMode))
 		controls_.set(controls::AwbMode, options_->awb_index);
-	if (!controls_.get(controls::AwbEnable))
-		controls_.set(controls::AwbEnable, options_->awbEn);
 	if (!controls_.get(controls::ColourGains) && options_->awb_gain_r && options_->awb_gain_b)
 		controls_.set(controls::ColourGains,
 					  libcamera::Span<const float, 2>({ options_->awb_gain_r, options_->awb_gain_b }));
@@ -571,6 +741,9 @@ void LibcameraApp::StartCamera()
 		controls_.set(controls::Saturation, options_->saturation);
 	if (!controls_.get(controls::Sharpness))
 		controls_.set(controls::Sharpness, options_->sharpness);
+	if (!controls_.get(controls::HdrMode) &&
+	    (options_->hdr == "auto" || options_->hdr == "single-exp"))
+		controls_.set(controls::HdrMode, controls::HdrModeSingleExposure);
 
 	// AF Controls, where supported and not already set
 	if (!controls_.get(controls::AfMode) && camera_->controls().count(&controls::AfMode) > 0)
@@ -612,6 +785,14 @@ void LibcameraApp::StartCamera()
 		controls_.set(controls::LensPosition, f);
 	}
 
+	if (options_->flicker_period && !controls_.get(controls::AeFlickerMode) &&
+		camera_->controls().find(&controls::AeFlickerMode) != camera_->controls().end() &&
+		camera_->controls().find(&controls::AeFlickerPeriod) != camera_->controls().end())
+	{
+		controls_.set(controls::AeFlickerMode, controls::FlickerManual);
+		controls_.set(controls::AeFlickerPeriod, options_->flicker_period.get<std::chrono::microseconds>());
+	}
+
 	if (camera_->start(&controls_))
 		throw std::runtime_error("failed to start camera");
 	controls_.clear();
@@ -620,7 +801,7 @@ void LibcameraApp::StartCamera()
 
 	post_processor_.Start();
 
-	camera_->requestCompleted.connect(this, &LibcameraApp::requestComplete);
+	camera_->requestCompleted.connect(this, &RPiCamApp::requestComplete);
 
 	for (std::unique_ptr<Request> &request : requests_)
 	{
@@ -631,7 +812,7 @@ void LibcameraApp::StartCamera()
 	LOG(2, "Camera started!");
 }
 
-void LibcameraApp::StopCamera()
+void RPiCamApp::StopCamera()
 {
 	{
 		// We don't want QueueRequest to run asynchronously while we stop the camera.
@@ -648,7 +829,7 @@ void LibcameraApp::StopCamera()
 	}
 
 	if (camera_)
-		camera_->requestCompleted.disconnect(this, &LibcameraApp::requestComplete);
+		camera_->requestCompleted.disconnect(this, &RPiCamApp::requestComplete);
 
 	// An application might be holding a CompletedRequest, so queueRequest will get
 	// called to delete it later, but we need to know not to try and re-queue it.
@@ -664,12 +845,12 @@ void LibcameraApp::StopCamera()
 		LOG(2, "Camera stopped!");
 }
 
-LibcameraApp::Msg LibcameraApp::Wait()
+RPiCamApp::Msg RPiCamApp::Wait()
 {
 	return msg_queue_.Wait();
 }
 
-void LibcameraApp::queueRequest(CompletedRequest *completed_request)
+void RPiCamApp::queueRequest(CompletedRequest *completed_request)
 {
 	BufferMap buffers(std::move(completed_request->buffers));
 
@@ -701,6 +882,17 @@ void LibcameraApp::queueRequest(CompletedRequest *completed_request)
 
 	for (auto const &p : buffers)
 	{
+		struct dma_buf_sync dma_sync {};
+		dma_sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+
+		auto it = mapped_buffers_.find(p.second);
+		if (it == mapped_buffers_.end())
+			throw std::runtime_error("failed to identify queue request buffer");
+
+		int ret = ::ioctl(p.second->planes()[0].fd.get(), DMA_BUF_IOCTL_SYNC, &dma_sync);
+		if (ret)
+			throw std::runtime_error("failed to sync dma buf on queue request");
+
 		if (request->addBuffer(p.first, p.second) < 0)
 			throw std::runtime_error("failed to add buffer to request in QueueRequest");
 	}
@@ -714,12 +906,12 @@ void LibcameraApp::queueRequest(CompletedRequest *completed_request)
 		throw std::runtime_error("failed to queue request");
 }
 
-void LibcameraApp::PostMessage(MsgType &t, MsgPayload &p)
+void RPiCamApp::PostMessage(MsgType &t, MsgPayload &p)
 {
 	msg_queue_.Post(Msg(t, std::move(p)));
 }
 
-libcamera::Stream *LibcameraApp::GetStream(std::string const &name, StreamInfo *info) const
+libcamera::Stream *RPiCamApp::GetStream(std::string const &name, StreamInfo *info) const
 {
 	auto it = streams_.find(name);
 	if (it == streams_.end())
@@ -729,32 +921,32 @@ libcamera::Stream *LibcameraApp::GetStream(std::string const &name, StreamInfo *
 	return it->second;
 }
 
-libcamera::Stream *LibcameraApp::ViewfinderStream(StreamInfo *info) const
+libcamera::Stream *RPiCamApp::ViewfinderStream(StreamInfo *info) const
 {
 	return GetStream("viewfinder", info);
 }
 
-libcamera::Stream *LibcameraApp::StillStream(StreamInfo *info) const
+libcamera::Stream *RPiCamApp::StillStream(StreamInfo *info) const
 {
 	return GetStream("still", info);
 }
 
-libcamera::Stream *LibcameraApp::RawStream(StreamInfo *info) const
+libcamera::Stream *RPiCamApp::RawStream(StreamInfo *info) const
 {
 	return GetStream("raw", info);
 }
 
-libcamera::Stream *LibcameraApp::VideoStream(StreamInfo *info) const
+libcamera::Stream *RPiCamApp::VideoStream(StreamInfo *info) const
 {
 	return GetStream("video", info);
 }
 
-libcamera::Stream *LibcameraApp::LoresStream(StreamInfo *info) const
+libcamera::Stream *RPiCamApp::LoresStream(StreamInfo *info) const
 {
 	return GetStream("lores", info);
 }
 
-libcamera::Stream *LibcameraApp::GetMainStream() const
+libcamera::Stream *RPiCamApp::GetMainStream() const
 {
 	for (auto &p : streams_)
 	{
@@ -765,15 +957,12 @@ libcamera::Stream *LibcameraApp::GetMainStream() const
 	return nullptr;
 }
 
-std::vector<libcamera::Span<uint8_t>> LibcameraApp::Mmap(FrameBuffer *buffer) const
+const libcamera::CameraManager *RPiCamApp::GetCameraManager() const
 {
-	auto item = mapped_buffers_.find(buffer);
-	if (item == mapped_buffers_.end())
-		return {};
-	return item->second;
+	return camera_manager_.get();
 }
 
-void LibcameraApp::ShowPreview(CompletedRequestPtr &completed_request, Stream *stream)
+void RPiCamApp::ShowPreview(CompletedRequestPtr &completed_request, Stream *stream)
 {
 	std::lock_guard<std::mutex> lock(preview_item_mutex_);
 	if (!preview_item_.stream)
@@ -783,7 +972,7 @@ void LibcameraApp::ShowPreview(CompletedRequestPtr &completed_request, Stream *s
 	preview_cond_var_.notify_one();
 }
 
-void LibcameraApp::SetControls(const ControlList &controls)
+void RPiCamApp::SetControls(const ControlList &controls)
 {
 	std::lock_guard<std::mutex> lock(control_mutex_);
 
@@ -794,7 +983,7 @@ void LibcameraApp::SetControls(const ControlList &controls)
 		controls_.set(c.first, c.second);
 }
 
-StreamInfo LibcameraApp::GetStreamInfo(Stream const *stream) const
+StreamInfo RPiCamApp::GetStreamInfo(Stream const *stream) const
 {
 	StreamConfiguration const &cfg = stream->configuration();
 	StreamInfo info;
@@ -806,7 +995,7 @@ StreamInfo LibcameraApp::GetStreamInfo(Stream const *stream) const
 	return info;
 }
 
-void LibcameraApp::setupCapture()
+void RPiCamApp::setupCapture()
 {
 	// First finish setting up the configuration.
 
@@ -826,33 +1015,31 @@ void LibcameraApp::setupCapture()
 
 	// Next allocate all the buffers we need, mmap them and store them on a free list.
 
-	allocator_ = new FrameBufferAllocator(camera_);
 	for (StreamConfiguration &config : *configuration_)
 	{
 		Stream *stream = config.stream();
+		std::vector<std::unique_ptr<FrameBuffer>> fb;
 
-		if (allocator_->allocate(stream) < 0)
-			throw std::runtime_error("failed to allocate capture buffers");
-
-		for (const std::unique_ptr<FrameBuffer> &buffer : allocator_->buffers(stream))
+		for (unsigned int i = 0; i < config.bufferCount; i++)
 		{
-			// "Single plane" buffers appear as multi-plane here, but we can spot them because then
-			// planes all share the same fd. We accumulate them so as to mmap the buffer only once.
-			size_t buffer_size = 0;
-			for (unsigned i = 0; i < buffer->planes().size(); i++)
-			{
-				const FrameBuffer::Plane &plane = buffer->planes()[i];
-				buffer_size += plane.length;
-				if (i == buffer->planes().size() - 1 || plane.fd.get() != buffer->planes()[i + 1].fd.get())
-				{
-					void *memory = mmap(NULL, buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED, plane.fd.get(), 0);
-					mapped_buffers_[buffer.get()].push_back(
-						libcamera::Span<uint8_t>(static_cast<uint8_t *>(memory), buffer_size));
-					buffer_size = 0;
-				}
-			}
-			frame_buffers_[stream].push(buffer.get());
+			std::string name("rpicam-apps" + std::to_string(i));
+			libcamera::UniqueFD fd = dma_heap_.alloc(name.c_str(), config.frameSize);
+
+			if (!fd.isValid())
+				throw std::runtime_error("failed to allocate capture buffers for stream");
+
+			std::vector<FrameBuffer::Plane> plane(1);
+			plane[0].fd = libcamera::SharedFD(std::move(fd));
+			plane[0].offset = 0;
+			plane[0].length = config.frameSize;
+
+			fb.push_back(std::make_unique<FrameBuffer>(plane));
+			void *memory = mmap(NULL, config.frameSize, PROT_READ | PROT_WRITE, MAP_SHARED, plane[0].fd.get(), 0);
+			mapped_buffers_[fb.back().get()].push_back(
+						libcamera::Span<uint8_t>(static_cast<uint8_t *>(memory), config.frameSize));
 		}
+
+		frame_buffers_[stream] = std::move(fb);
 	}
 	LOG(2, "Buffers allocated and mapped");
 
@@ -861,9 +1048,17 @@ void LibcameraApp::setupCapture()
 	// The requests will be made when StartCamera() is called.
 }
 
-void LibcameraApp::makeRequests()
+void RPiCamApp::makeRequests()
 {
-	auto free_buffers(frame_buffers_);
+	std::map<Stream *, std::queue<FrameBuffer *>> free_buffers;
+
+	for (auto &kv : frame_buffers_)
+	{
+		free_buffers[kv.first] = {};
+		for (auto &b : kv.second)
+			free_buffers[kv.first].push(b.get());
+	}
+
 	while (true)
 	{
 		for (StreamConfiguration &config : *configuration_)
@@ -892,7 +1087,7 @@ void LibcameraApp::makeRequests()
 	}
 }
 
-void LibcameraApp::requestComplete(Request *request)
+void RPiCamApp::requestComplete(Request *request)
 {
 	if (request->status() == Request::RequestCancelled)
 	{
@@ -902,6 +1097,19 @@ void LibcameraApp::requestComplete(Request *request)
 			msg_queue_.Post(Msg(MsgType::Timeout));
 
 		return;
+	}
+
+	struct dma_buf_sync dma_sync {};
+	dma_sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+	for (auto const &buffer_map : request->buffers())
+	{
+		auto it = mapped_buffers_.find(buffer_map.second);
+		if (it == mapped_buffers_.end())
+			throw std::runtime_error("failed to identify request complete buffer");
+
+		int ret = ::ioctl(buffer_map.second->planes()[0].fd.get(), DMA_BUF_IOCTL_SYNC, &dma_sync);
+		if (ret)
+			throw std::runtime_error("failed to sync dma buf on request complete");
 	}
 
 	CompletedRequest *r = new CompletedRequest(sequence_++, request);
@@ -925,7 +1133,7 @@ void LibcameraApp::requestComplete(Request *request)
 	post_processor_.Process(payload); // post-processor can re-use our shared_ptr
 }
 
-void LibcameraApp::previewDoneCallback(int fd)
+void RPiCamApp::previewDoneCallback(int fd)
 {
 	std::lock_guard<std::mutex> lock(preview_mutex_);
 	auto it = preview_completed_requests_.find(fd);
@@ -934,13 +1142,13 @@ void LibcameraApp::previewDoneCallback(int fd)
 	preview_completed_requests_.erase(it); // drop shared_ptr reference
 }
 
-void LibcameraApp::startPreview()
+void RPiCamApp::startPreview()
 {
 	preview_abort_ = false;
-	preview_thread_ = std::thread(&LibcameraApp::previewThread, this);
+	preview_thread_ = std::thread(&RPiCamApp::previewThread, this);
 }
 
-void LibcameraApp::stopPreview()
+void RPiCamApp::stopPreview()
 {
 	if (!preview_thread_.joinable()) // in case never started
 		return;
@@ -955,7 +1163,7 @@ void LibcameraApp::stopPreview()
 	preview_completed_requests_.clear();
 }
 
-void LibcameraApp::previewThread()
+void RPiCamApp::previewThread()
 {
 	while (true)
 	{
@@ -979,7 +1187,8 @@ void LibcameraApp::previewThread()
 
 		StreamInfo info = GetStreamInfo(item.stream);
 		FrameBuffer *buffer = item.completed_request->buffers[item.stream];
-		libcamera::Span span = Mmap(buffer)[0];
+		BufferReadSync r(this, buffer);
+		libcamera::Span span = r.Get()[0];
 
 		// Fill the frame info with the ControlList items and ancillary bits.
 		FrameInfo frame_info(item.completed_request->metadata);
@@ -1007,7 +1216,7 @@ void LibcameraApp::previewThread()
 	}
 }
 
-void LibcameraApp::configureDenoise(const std::string &denoise_mode)
+void RPiCamApp::configureDenoise(const std::string &denoise_mode)
 {
 	using namespace libcamera::controls::draft;
 

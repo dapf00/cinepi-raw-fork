@@ -3,20 +3,19 @@
 using namespace std;
 using namespace std::chrono;
 
-#define THREAD_SLEEP_MS 10
-
-#define LV_KEY_ZOOM "lv_zoom"
-#define LV_KEY_ENABLE "lv_en"
-
 #define CP_DEF_WIDTH 1920
 #define CP_DEF_HEIGHT 1080
 #define CP_DEF_FRAMERATE 30
 #define CP_DEF_ISO 400
-#define CP_DEF_SHUTTER 60
+#define CP_DEF_SHUTTER 50
 #define CP_DEF_AWB 1
-#define CP_DEF_COMPRESS 1
+#define CP_DEF_COMPRESS 0
+#define CP_DEF_THUMBNAIL 1
+#define CP_DEF_THUMBNAIL_SIZE 3
 
 void CinePIController::sync(){
+    // getAllKeysAndValuesFromRedis();
+
     auto pipe = redis_->pipeline();
     auto pipe_replies = pipe.get(CONTROL_KEY_WIDTH)
                             .get(CONTROL_KEY_HEIGHT)
@@ -26,9 +25,12 @@ void CinePIController::sync(){
                             .get(CONTROL_KEY_WB)
                             .get(CONTROL_KEY_COLORGAINS)
                             .get(CONTROL_KEY_COMPRESSION)
+                            .get(CONTROL_KEY_THUMBNAIL)
+                            .get(CONTROL_KEY_THUMBNAIL_SIZE)
+                            .get("log_level")
+                            .get("ucm")
+                            .get("mic_gain")
                             .exec();
-
-    // width_ = stoi(pipe_replies.get<std::optional<std::string>>(0).value_or("1920"));
 
     auto width = pipe_replies.get<OptionalString>(0);
     if(width){
@@ -37,6 +39,8 @@ void CinePIController::sync(){
         width_ = CP_DEF_WIDTH;
         redis_->set(CONTROL_KEY_WIDTH, to_string(width_));
     }
+
+    console->critical(1);
         
     auto height = pipe_replies.get<OptionalString>(1);
     if(height){
@@ -46,6 +50,8 @@ void CinePIController::sync(){
         redis_->set(CONTROL_KEY_HEIGHT, to_string(height_)); 
     }
 
+    console->critical(2);
+
     auto framerate = pipe_replies.get<OptionalString>(2);
     if(framerate){
         framerate_ = stoi(*framerate);
@@ -53,6 +59,8 @@ void CinePIController::sync(){
         framerate_ = CP_DEF_FRAMERATE;
         redis_->set(CONTROL_KEY_FRAMERATE, to_string(framerate_)); 
     }
+
+    console->critical(3);
 
     auto iso = pipe_replies.get<OptionalString>(3);
     if(iso){
@@ -62,6 +70,8 @@ void CinePIController::sync(){
         redis_->set(CONTROL_KEY_ISO, to_string(iso_)); 
     }
 
+    console->critical(4);
+
     auto shutter_speed = pipe_replies.get<OptionalString>(4);
     if(shutter_speed){
         shutter_speed_ = stoi(*shutter_speed);
@@ -70,6 +80,8 @@ void CinePIController::sync(){
         redis_->set(CONTROL_KEY_SHUTTER_SPEED, to_string(shutter_speed_)); 
     }
 
+    console->critical(5);
+
     auto awb = pipe_replies.get<OptionalString>(5);
     if(awb){
         awb_ = stoi(*awb);
@@ -77,6 +89,8 @@ void CinePIController::sync(){
         awb_ = CP_DEF_AWB;
         redis_->set(CONTROL_KEY_WB, to_string(awb_)); 
     }
+
+    console->critical(6);
     
     auto compress = pipe_replies.get<OptionalString>(7);
     if(compress){
@@ -86,6 +100,8 @@ void CinePIController::sync(){
         redis_->set(CONTROL_KEY_COMPRESSION, to_string(compression_));
     }
 
+    console->critical(7);
+
     char *ptr = strtok(&(*pipe_replies.get<OptionalString>(6))[0], ",");
     uint8_t i = 0;
     while(ptr != NULL){
@@ -94,13 +110,72 @@ void CinePIController::sync(){
         ptr = strtok(NULL, ",");  
     }
 
+    console->critical(8);
+
+    auto thumbnail = pipe_replies.get<OptionalString>(8);
+    if(thumbnail){
+        thumbnail_ = stoi(*thumbnail);
+    }else{
+        thumbnail_ = CP_DEF_THUMBNAIL;
+        redis_->set(CONTROL_KEY_THUMBNAIL, to_string(thumbnail_));
+    }
+
+    console->critical(9);
+
+    auto thumbnail_size = pipe_replies.get<OptionalString>(9);
+    if(thumbnail_size){
+        thumbnail_size_ = stoi(*thumbnail_size);
+    }else{
+        thumbnail_size_ = CP_DEF_THUMBNAIL_SIZE;
+        redis_->set(CONTROL_KEY_THUMBNAIL, to_string(thumbnail_size_));
+    }
+
+    console->critical(10);
+
+    auto log_level = pipe_replies.get<OptionalString>(10);
+    if(log_level){
+        spdlog::set_level(spdlog::level::from_str(*log_level));
+    }
+
+    console->critical(11);
+
+    auto ucm = pipe_replies.get<OptionalString>(11);
+    if(ucm){
+        options_->ucm = *ucm;
+    }
+
+    console->critical(12);
+
+    auto mic_gain = pipe_replies.get<OptionalString>(12);
+    if(mic_gain){
+        options_->mic_gain = stoi(*mic_gain);
+        system(("amixer -c 1 sset 'Mic' " + *mic_gain + " > /dev/null 2>&1").c_str());
+    }
+
+    console->critical(13);
+
+    // std::unordered_map<std::string, std::string> m;
+    // redis_->hgetall("rawCrop", std::inserter(m, m.begin()));
+
+    // options_->rawCrop[0] = std::stoi(m["offset_y_start"]);
+    // options_->rawCrop[1] = std::stoi(m["offset_y_end"]);
+    // options_->rawCrop[2] = std::stoi(m["offset_x_start"]);
+    // options_->rawCrop[3] = std::stoi(m["offset_x_end"]);
+
+    console->critical(14);
+
+    libcamera::ControlList cl;
+    cl.set(libcamera::controls::rpi::StatsOutputEnable, true);
+    app_->SetControls(cl);
+
+    options_->thumbnail = thumbnail_;
+    options_->thumbnailSize = thumbnail_size_;
+    
     options_->compression = compression_;
-    options_->width = width_;
-    options_->height = height_;
+    // options_->width = width_;
+    // options_->height = height_;
     options_->framerate = framerate_;
     options_->gain = iso_;
-
-    options_->shutter = shutter_speed_ * 1e+6;
 
     options_->awbEn = awb_;
     if(awb_)
@@ -111,64 +186,88 @@ void CinePIController::sync(){
     }
     
     options_->denoise = "off";
-    options_->lores_width = 400;
-    options_->lores_height = 200;
+    // options_->lores_width = options_->width >> 3;
+    // options_->lores_height = options_->height >> 3;
     options_->mode_string = "0:0:0:0";
 }
 
 void CinePIController::process(CompletedRequestPtr &completed_request){
     CinePIFrameInfo info(completed_request->metadata);
 
-    redis_->publish(CHANNEL_STATS, to_string(completed_request->framerate));
-    redis_->publish(CHANNEL_STATS, to_string(info.colorTemp));
-    redis_->publish(CHANNEL_STATS, to_string(info.focus));
-    redis_->publish(CHANNEL_STATS, to_string(app_->GetEncoder()->getFrameCount()));
-    redis_->publish(CHANNEL_STATS, to_string(app_->GetEncoder()->bufferSize()));
-    
-    #ifdef LIBCAMERA_CINEPI_CONTROLS 
-        redis_->publish(CHANNEL_STATS, info.histoString());
-        redis_->publish(CHANNEL_STATS, to_string(info.trafficLight));
-        redis_->publish(CHANNEL_HISTOGRAM, StringView(reinterpret_cast<const char *>(info.histogram), sizeof(info.histogram)));
-    #endif
-}
+    Json::Value data;
+    Json::Value histo;
+    data["framerate"] = completed_request->framerate;
+    data["colorTemp"] = info.colorTemp;
+    data["focus"] = info.focus;
+    data["frameCount"] = app_->GetEncoder()->getFrameCount();
+    data["bufferSize"] = app_->GetEncoder()->bufferSize();
 
+    #ifdef LIBCAMERA_CINEPI_CONTROLS 
+        histo["histoString"] = info.histoString();
+        histo["trafficLight"] = info.trafficLight;
+        
+        // Assuming histogram is binary data; encode to Base64 or similar if needed
+        histo["histogram"] = StringView(reinterpret_cast<const char *>(info.histogram), sizeof(info.histogram));
+        redis_->publish(CHANNEL_HISTOGRAM, histo.toStyledString());
+    #endif
+
+    redis_->publish(CHANNEL_STATS, data.toStyledString());
+    
+}
 
 void CinePIController::mainThread(){
 
-    time_point<system_clock> t = system_clock::now();
-
-    LOG(1, "CINEPI_CONTROLLER THREAD STARTED");
+    console->info("CinePIController Started!");
     auto sub = redis_->subscriber();
 
-    sub.on_message([this](std::string channel, std::string msg) {
-        std::cout << msg << " from: " << channel << std::endl;
+    using MessageHandler = std::function<void(const std::optional<std::string>&)>;
 
-        if(msg.compare(CONTROL_TRIGGER_STILL) == 0){
-            triggerStill_ = !triggerStill_;
-            if(!triggerStill_){
-                still_number_++;
-            }
-        }
+    std::unordered_map<std::string, MessageHandler> handlers = {
+        { CONTROL_KEY_RAW_CROP, [this](const std::optional<std::string>& r) {
+            std::unordered_map<std::string, std::string> m;
+            redis_->hgetall("rawCrop", std::inserter(m, m.begin()));
 
-        auto r = redis_->get(msg);
-        if(r){
-            if(msg.compare(CONTROL_KEY_RECORD) == 0){
-                trigger_ = !is_recording_;
+            options_->rawCrop[0] = std::stoi(m["offset_y_start"]);
+            options_->rawCrop[1] = std::stoi(m["offset_y_end"]);
+            options_->rawCrop[2] = std::stoi(m["offset_x_start"]);
+            options_->rawCrop[3] = std::stoi(m["offset_x_end"]);
+        }},
+        { CONTROL_KEY_RECORD, [this](const std::optional<std::string>& r) {
+            if(r) {
+                // int rec = stoi(*r);
+                // switch(rec){
+                //     case 1:
+                //         trigger_ = rec;
+                //         is_recording_ = (bool)rec;
+                //     case 0:
+                //         trigger_ = 0;
+                //         is_recording_ = (bool)rec;
+                //     case -1:
+                //         trigger_ = rec;
+                //         is_recording_ = false;
+                // };
+                trigger_ = !is_recording_ ? 1 : -1;
                 is_recording_ = (bool)stoi(*r);
-            } 
-            else if (msg.compare(CONTROL_KEY_ISO) == 0){
+            }
+        }},
+        { CONTROL_KEY_ISO, [this](const std::optional<std::string>& r) {
+            if(r) {
                 iso_ = (unsigned int)(stoi(*r)/100.0);
                 libcamera::ControlList cl;
                 cl.set(libcamera::controls::AnalogueGain, iso_);
                 app_->SetControls(cl);
             }
-            else if (msg.compare(CONTROL_KEY_WB) == 0){
+        }},
+        { CONTROL_KEY_WB, [this](const std::optional<std::string>& r) {
+            if(r) {
                 awb_ = (unsigned int)(stoi(*r));
                 libcamera::ControlList cl;
                 cl.set(libcamera::controls::AwbEnable, awb_);
                 app_->SetControls(cl);
-            } 
-            else if (msg.compare(CONTROL_KEY_COLORGAINS) == 0){
+            }
+        }},
+        { CONTROL_KEY_COLORGAINS, [this](const std::optional<std::string>& r) {
+            if(r) {
                 libcamera::ControlList cl;
                 cl.set(libcamera::controls::AwbEnable, false);
                 app_->SetControls(cl);
@@ -178,85 +277,115 @@ void CinePIController::mainThread(){
                 while(ptr != NULL){
                     cg_rb_[i] = (float)stof(ptr);
                     i++;
-                    ptr = strtok(NULL, ",");  
+                    ptr = strtok(NULL, ",");
                 }
                 cl.set(libcamera::controls::ColourGains, libcamera::Span<const float, 2>({ cg_rb_[0], cg_rb_[1] }));
                 app_->SetControls(cl);
             }
-            else if (msg.compare(CONTROL_KEY_SHUTTER_ANGLE) == 0){
-                // StreamInfo info = app_->GetStreamInfo(app->RawStream());
+        }},
+        { CONTROL_KEY_SHUTTER_ANGLE, [this](const std::optional<std::string>& r) {
+            if(r) {
                 shutter_angle_ = stof(*r);
                 shutter_speed_ = 1.0 / ((framerate_ * 360.0) / shutter_angle_);
                 uint64_t shutterTime = shutter_speed_ * 1e+6;
                 libcamera::ControlList cl;
                 cl.set(libcamera::controls::ExposureTime, shutterTime);
                 app_->SetControls(cl);
-            } 
-            else if (msg.compare(CONTROL_KEY_SHUTTER_SPEED) == 0){
+            }
+        }},
+        { CONTROL_KEY_SHUTTER_SPEED, [this](const std::optional<std::string>& r) {
+            if(r) {
                 shutter_speed_ = 1.0 / stof(*r);
                 uint64_t shutterTime = shutter_speed_ * 1e+6;
                 libcamera::ControlList cl;
                 cl.set(libcamera::controls::ExposureTime, shutterTime);
                 app_->SetControls(cl);
             }
-            else if(msg.compare(CONTROL_KEY_WIDTH) == 0){
+        }},
+        { CONTROL_KEY_WIDTH, [this](const std::optional<std::string>& r) {
+            if(r) {
                 width_ = (uint16_t)(stoi(*r));
                 options_->width = width_;
             }
-            else if(msg.compare(CONTROL_KEY_HEIGHT) == 0){
+        }},
+        { CONTROL_KEY_HEIGHT, [this](const std::optional<std::string>& r) {
+            if(r) {
                 height_ = (uint16_t)(stoi(*r));
                 options_->height = height_;
             }
-            else if(msg.compare(CONTROL_KEY_COMPRESSION) == 0){
+        }},
+        { CONTROL_KEY_COMPRESSION, [this](const std::optional<std::string>& r) {
+            if(r) {
                 compression_ = stoi(*r);
                 options_->compression = compression_;
                 cameraInit_ = true;
             }
-            else if(msg.compare(CONTROL_KEY_FRAMERATE) == 0){
+        }},
+        { CONTROL_KEY_FRAMERATE, [this](const std::optional<std::string>& r) {
+            if(r) {
                 framerate_ = stof(*r);
                 options_->framerate = framerate_;
-                cameraInit_ = true;
-            }
-            else if(msg.compare(CONTROL_KEY_CAMERAINIT) == 0){
-                cameraInit_ = true;
-            } 
-            else if(msg.compare(LV_KEY_ZOOM) == 0){
-                float zoom = stof(*r);
 
-                float roi_x = 1.0, roi_y = 1.0, roi_height = 1.0, roi_width = 1.0;
+                long int durationValues[2] = { static_cast<long int>(1000000.0 / framerate_),
+                                            static_cast<long int>(1000000.0 / framerate_) };
 
-                roi_width = roi_width / zoom;
-                roi_height = roi_height / zoom;
-                roi_x = (roi_x - roi_width) / 2;
-                roi_y = (roi_y - roi_height) / 2;
-
-                libcamera::Rectangle sensor_area = *app_->CameraModel()->properties().get(properties::ScalerCropMaximum);
-                int x = roi_x * sensor_area.width;
-                int y = roi_y * sensor_area.height;
-                int w = roi_width * sensor_area.width;
-                int h = roi_height * sensor_area.height;
-                libcamera::Rectangle crop(x, y, w, h);
-                crop.translateBy(sensor_area.topLeft());
-
+                libcamera::Span<const long int, 2> durationRange(durationValues, 2);
                 libcamera::ControlList cl;
-                cl.set(libcamera::controls::ScalerCrop, crop);
+                cl.set(libcamera::controls::FrameDurationLimits, durationRange);
                 app_->SetControls(cl);
             }
+        }},
+        { CONTROL_KEY_CAMERAINIT, [this](const std::optional<std::string>& r) {
+            cameraInit_ = true;
+        }},
+        { CONTROL_KEY_THUMBNAIL, [this](const std::optional<std::string>& r) {
+            if(r) {
+                options_->thumbnail = stoi(*r);
+            }
+        }},
+        { CONTROL_KEY_THUMBNAIL_SIZE, [this](const std::optional<std::string>& r) {
+            if(r) {
+                options_->thumbnailSize = stoi(*r);
+                cameraInit_ = true;
+            }
+        }},
+        { "log_level", [this](const std::optional<std::string>& r) {
+            if(r) {
+                spdlog::set_level(spdlog::level::from_str(*r));
+            }
+        }},
+        { "mic_gain", [this](const std::optional<std::string>& r) {
+            if(r) {
+                options_->mic_gain = stoi(*r);
+                system(("amixer -c 1 sset 'Mic' " + *r + " > /dev/null 2>&1").c_str());
+            }
+        }}
+    };
 
-            redis_->bgsave();
+
+    sub.on_message([this, &handlers](std::string channel, std::string msg) {
+        console->trace("{} from: {}", msg, channel);
+
+        auto r = redis_->get(msg);
+
+        auto it = handlers.find(msg);
+        if (it != handlers.end()) {
+            it->second(r);
         }
+        
+        redis_->bgsave();
     });
 
     sub.subscribe(CHANNEL_CONTROLS);
 
     while (true) {
         try {
+            if(abortThread_){
+                return;
+            }
             sub.consume();
         } catch (const Error &err) {
             // Handle exceptions.
         }
-
-        t += milliseconds(THREAD_SLEEP_MS);
-        this_thread::sleep_until(t);
     }
 }

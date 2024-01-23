@@ -6,19 +6,25 @@
  */
 
 #include <chrono>
-
+#include "cinepi_sound.hpp"
 #include "cinepi_controller.hpp"
+
 #include "dng_encoder.hpp"
 #include "output/output.hpp"
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
 
 using namespace std::placeholders;
 
 // The main even loop for the application.
-
-static void event_loop(CinePIRecorder &app, CinePIController &controller)
+static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePISound &sound)
 {
 	controller.start();
 	controller.sync();
+
+	sound.start();
+
+	static auto console = spdlog::stdout_color_mt("event_loop"); 
 
 	RawOptions const *options = app.GetOptions();
 	std::unique_ptr<Output> output = std::unique_ptr<Output>(Output::Create(options));
@@ -27,35 +33,39 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller)
 
 	app.OpenCamera();
 	app.StartEncoder();
-	app.GetOptions()->sensor = app.CameraModel()->properties().get(libcamera::properties::Model).value_or(app.CameraId());
+	std::vector<std::shared_ptr<libcamera::Camera>> cameras = app.GetCameras();
+	if (cameras.size() == 0)
+    	throw std::runtime_error("no cameras available");
+	app.GetOptions()->model = app.CameraModel();
 
 	for (unsigned int count = 0; ; count++)
 	{
-		// if we change framerate or sensor mode, restart the camera. 
+		// if we change the sensor mode, restart the camera. 
 		if(controller.configChanged()){
 			if(controller.cameraRunning){
 				app.StopCamera();
 				app.Teardown();
 			}
-			app.ConfigureVideo(CinePIRecorder::FLAG_VIDEO_RAW);
+			app.ConfigureVideo(CinePIRecorder::FLAG_VIDEO_RAW, 0);
 			app.StartCamera();
 			controller.cameraRunning = true;
 
 			libcamera::StreamConfiguration const &cfg = app.RawStream()->configuration();
-			LOG(1, "Raw stream: " << cfg.size.width << "x" << cfg.size.height << " stride " << cfg.stride << " format "
-								  << cfg.pixelFormat.toString());
-
+			console->info("Raw stream: {}x{} : {} : {}", cfg.size.width, cfg.size.height, cfg.stride, cfg.pixelFormat.toString());
+			app.GetEncoder()->reset_encoder();
 			controller.process_stream_info(cfg);
 		}
 
 		CinePIRecorder::Msg msg = app.Wait();
 
-		if (msg.type == LibcameraApp::MsgType::Quit)
+		controller.setShutterAngle(180.0);
+
+		if (msg.type == RPiCamApp::MsgType::Quit)
 			return;
 
-		if (msg.type == LibcameraApp::MsgType::Timeout)
+		if (msg.type == RPiCamApp::MsgType::Timeout)
 		{
-			LOG_ERROR("ERROR: Device timeout detected, attempting a restart!!!");
+			console->error("Device timeout detected, attempting a restart!!!");
 			app.StopCamera();
 			app.StartCamera();
 			continue;
@@ -72,26 +82,26 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller)
 		int trigger = controller.triggerRec();
 		if(trigger > 0){
 			controller.folderOpen = create_clip_folder(app.GetOptions(), controller.getClipNumber());
+			app.GetEncoder()->resetFrameCount();
+			sound.record_start();
 		} else if (trigger < 0){
 			controller.folderOpen = false;
-			app.GetEncoder()->resetFrameCount();
-		}
-	
-		// send frame to dng encoder and save to disk
-		if(controller.isRecording() && controller.folderOpen){
-			app.EncodeBuffer(completed_request, app.RawStream(), app.LoresStream());
+			sound.record_stop();
 		}
 
-		// check for still trigger signal, open the stills folder and save a still frame
-		int still_trigger = controller.triggerStill();
-		if(still_trigger){
-			create_stills_folder(app.GetOptions(), controller.getStillNumber());
-			app.GetEncoder()->still_capture = true;
+		// send frame to dng encoder and save to disk
+		if(controller.isRecording() && sound.isRecording() && controller.folderOpen){
+			// check to make sure our buffer is not full, stop recording if so. 
+			if(app.GetEncoder()->buffer_full()){
+				controller.setRecording(false);
+			}
 			app.EncodeBuffer(completed_request, app.RawStream(), app.LoresStream());
 		}
 
 		// show frame on display
-		app.ShowPreview(completed_request, app.VideoStream());        
+		app.ShowPreview(completed_request, app.GetMainStream());       
+
+		console->info("Frame Number: {}", count);
 	}
 }
 
@@ -100,17 +110,24 @@ int main(int argc, char *argv[])
 	try
 	{
 		CinePIRecorder app;
+		CinePISound sound(&app);
 		CinePIController controller(&app);
+
+		// libcamera::logSetTarget(libcamera::LoggingTargetNone);
 
 		RawOptions *options = app.GetOptions();
 		if (options->Parse(argc, argv))
 		{
 			options->mediaDest = "/media/RAW";
+			options->rawCrop[0] = 0;
+			options->rawCrop[1] = 0;
+			options->rawCrop[2] = 0;
+			options->rawCrop[3] = 0;
 
 			if (options->verbose >= 2)
 				options->Print();
 
-			event_loop(app, controller);
+			event_loop(app, controller, sound);
 		}
 	}
 	catch (std::exception const &e)

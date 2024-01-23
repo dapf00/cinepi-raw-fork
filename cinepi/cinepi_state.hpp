@@ -19,8 +19,6 @@
 #include <thread>
 
 #define CONTROL_TRIGGER_RECORD "rec"
-#define CONTROL_TRIGGER_STILL "stll"
-#define CONTROL_TRIGGER_TIMELASPSE "tlps"
 
 #define CONTROL_KEY_RECORD "is_recording"
 #define CONTROL_KEY_ISO "iso"
@@ -34,6 +32,10 @@
 #define CONTROL_KEY_HEIGHT "height"
 #define CONTROL_KEY_MODE "mode"
 #define CONTROL_KEY_COMPRESSION "compress"
+#define CONTROL_KEY_THUMBNAIL "thumbnail"
+#define CONTROL_KEY_THUMBNAIL_SIZE "thumbnail_size"
+
+#define CONTROL_KEY_RAW_CROP "raw_crop"
 
 #define CONTROL_KEY_CAMERAINIT "cam_init"
 
@@ -43,16 +45,16 @@ class CinePIState
         CinePIState() : is_recording_(false), clip_number_(0), still_number_(0) {};
         ~CinePIState() {};
 
+        void setRecording(bool state){
+            is_recording_ = state;
+        }
+
         bool isRecording(){
             return is_recording_;
         }
 
         unsigned int getClipNumber(){
             return clip_number_;
-        }
-
-        unsigned int getStillNumber(){
-            return still_number_;
         }
 
     protected:
@@ -70,7 +72,9 @@ class CinePIState
         int mode_;
         int compression_;
 
+        int thumbnail_;
+        int thumbnail_size_;
+
         unsigned int clip_number_;
         unsigned int still_number_;
-        
 };
