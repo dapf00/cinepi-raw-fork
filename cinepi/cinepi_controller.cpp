@@ -201,16 +201,6 @@ void CinePIController::process(CompletedRequestPtr &completed_request){
     data["focus"] = info.focus;
     data["frameCount"] = app_->GetEncoder()->getFrameCount();
     data["bufferSize"] = app_->GetEncoder()->bufferSize();
-
-    #ifdef LIBCAMERA_CINEPI_CONTROLS 
-        histo["histoString"] = info.histoString();
-        histo["trafficLight"] = info.trafficLight;
-        
-        // Assuming histogram is binary data; encode to Base64 or similar if needed
-        histo["histogram"] = StringView(reinterpret_cast<const char *>(info.histogram), sizeof(info.histogram));
-        redis_->publish(CHANNEL_HISTOGRAM, histo.toStyledString());
-    #endif
-
     redis_->publish(CHANNEL_STATS, data.toStyledString());
     
 }
