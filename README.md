@@ -10,10 +10,22 @@ Requirements
 Please install the below requirements before continuing with the rest of the build process:
 
 [Redis](https://github.com/redis/redis)
+`sudo apt-get install redis-server`
 
 [Hiredis](https://github.com/redis/hiredis)
+`sudo apt-get install libhiredis-dev`
 
 [Redis++](https://github.com/sewenew/redis-plus-plus)
+`requires manual build`
+
+[spdlog](https://github.com/gabime/spdlog)
+`sudo apt install libspdlog-dev`
+
+[JsonCpp](https://github.com/open-source-parsers/jsoncpp)
+`sudo apt-get install libjsoncpp-dev`
+
+[cpp-mjpeg-streamer](https://github.com/nadjieb/cpp-mjpeg-streamer.git)
+`requires manual build`
 
 Build
 -----
