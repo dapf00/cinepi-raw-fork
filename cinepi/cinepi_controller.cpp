@@ -102,7 +102,7 @@ void CinePIController::sync(){
 
     console->critical(7);
 
-    char *ptr = strtok(&(*pipe_replies.get<OptionalString>(6))[0], ",");
+    char *ptr = NULL;//strtok(&(*pipe_replies.get<OptionalString>(6))[0], ",");
     uint8_t i = 0;
     while(ptr != NULL){
         cg_rb_[i] = (float)stof(ptr);
