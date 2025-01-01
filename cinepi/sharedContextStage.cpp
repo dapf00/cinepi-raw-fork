@@ -13,14 +13,16 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ipc.h>
-#include <sys/shm.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 
-#define PROJECT_ID 0x43494E45 // ASCII for "CINE"
+//#define PROJECT_ID 0x43494E45 // ASCII for "CINE"
+constexpr auto PROJECT_ID = "/CINE";
 
 struct SharedMetadata
 {
@@ -110,49 +112,54 @@ sharedContextStage::sharedContextStage(RPiCamApp *app) : PostProcessingStage(app
 	const int size = sizeof(SharedMemoryBuffer);
 
 	// Generate a unique key for the shared memory segment
-	segment_key = ftok("/tmp", PROJECT_ID);
+	// segment_key = ftok("/tmp", PROJECT_ID);
 
 	// Try to obtain an existing segment or create a new one
-	segment_id = shmget(segment_key, size, IPC_CREAT | S_IRUSR | S_IWUSR);
-	if (segment_id == -1)
+	//segment_id = shmget(segment_key, size, IPC_CREAT | S_IRUSR | S_IWUSR);
+	int fd = shm_open(PROJECT_ID, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
+	if (fd == -1)
 	{
-		// Handle error
+		spdlog::get("sharedContextStage")->error("shm_open failed: {}", errno);
+	}
+	if (ftruncate(fd, size) == -1)
+	{
+		spdlog::get("sharedContextStage")->error("fruncate failed: {}", errno);
 	}
 
 	// Attach the shared memory segment
-	shared_data = (SharedMemoryBuffer *)shmat(segment_id, NULL, 0);
+	shared_data = static_cast<SharedMemoryBuffer *>(mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
 	if (shared_data == (void *)-1)
 	{
-		// Handle error
+		spdlog::get("sharedContextStage")->error("mmap failed: {}", errno);
 	}
 
-	if (shared_data->frame == -1)
+	if (close(fd) == -1)
 	{
-		shared_data->frame = 0;
-		shared_data->procid = getpid();
-		shared_data->ts = getTs();
+		spdlog::get("sharedContextStage")->error("fclose failed: {}", errno);
 	}
-	else
-	{
-		shared_data->fd_raw = -1;
-		shared_data->fd_isp = -1;
-		shared_data->fd_lores = -1;
-		shared_data->frame = 0;
-		shared_data->procid = getpid();
-		shared_data->ts = getTs();
-	}
+	shared_data->fd_raw = -1;
+	shared_data->fd_isp = -1;
+	shared_data->fd_lores = -1;
+	shared_data->frame = 0;
+	shared_data->procid = getpid();
+	shared_data->ts = getTs();
+	spdlog::get("sharedContextStage")->info("SharedContextStage created");
 }
 
 sharedContextStage::~sharedContextStage()
 {
-	shmdt(shared_data);
-	shmctl(segment_id, IPC_RMID, NULL);
+	munmap(shared_data, sizeof(SharedMemoryBuffer));
+	shm_unlink(PROJECT_ID);
+	// 	shmdt(shared_data);
+	// 	shmctl(segment_id, IPC_RMID, NULL);
 }
 
 void sharedContextStage::Teardown()
 {
-	shmdt(shared_data);
-	shmctl(segment_id, IPC_RMID, NULL);
+	munmap(shared_data, sizeof(SharedMemoryBuffer));
+	shm_unlink(PROJECT_ID);
+	// shmdt(shared_data);
+	// shmctl(segment_id, IPC_RMID, NULL);
 }
 
 void sharedContextStage::Configure()
