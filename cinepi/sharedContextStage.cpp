@@ -1,4 +1,5 @@
 #include <mutex>
+#include <semaphore.h>
 #include <thread>
 #include <time.h>
 #include <unistd.h>
@@ -41,7 +42,7 @@ struct SharedMetadata
 
 struct SharedMemoryBuffer
 {
-	SharedMemoryBuffer() : fd_raw(-1), fd_isp(-1), fd_lores(-1), frame(-1), procid(-1) {}
+	sem_t sem;
 	int fd_raw;
 	int fd_isp;
 	int fd_lores;
@@ -143,11 +144,13 @@ sharedContextStage::sharedContextStage(RPiCamApp *app) : PostProcessingStage(app
 	shared_data->frame = 0;
 	shared_data->procid = getpid();
 	shared_data->ts = getTs();
+	sem_init(&shared_data->sem, 1, 1);
 	spdlog::get("sharedContextStage")->info("SharedContextStage created");
 }
 
 sharedContextStage::~sharedContextStage()
 {
+	sem_destroy(&shared_data->sem);
 	munmap(shared_data, sizeof(SharedMemoryBuffer));
 	shm_unlink(PROJECT_ID);
 	// 	shmdt(shared_data);
@@ -156,6 +159,7 @@ sharedContextStage::~sharedContextStage()
 
 void sharedContextStage::Teardown()
 {
+	sem_destroy(&shared_data->sem);
 	munmap(shared_data, sizeof(SharedMemoryBuffer));
 	shm_unlink(PROJECT_ID);
 	// shmdt(shared_data);
@@ -173,6 +177,10 @@ void sharedContextStage::Configure()
 
 bool sharedContextStage::Process(CompletedRequestPtr &completed_request)
 {
+	if (sem_wait(&shared_data->sem) == -1)
+	{
+		spdlog::get("sharedContextStage")->error("sem_wait failed: {}", errno);
+	}
 	shared_data->ts = getTs();
 
 	auto stats = completed_request->metadata.get(libcamera::controls::rpi::PispStatsOutput);
@@ -196,6 +204,10 @@ bool sharedContextStage::Process(CompletedRequestPtr &completed_request)
 
 	shared_data->frame++;
 
+	if (sem_post(&shared_data->sem) == -1)
+	{
+		spdlog::get("sharedContextStage")->error("sem_post failed: {}", errno);
+	}
 	return false;
 }
 
