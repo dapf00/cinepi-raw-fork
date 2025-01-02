@@ -1,3 +1,6 @@
+#include "cinepi_recorder.hpp"
+#include "raw_options.hpp"
+
 #include <mutex>
 #include <semaphore.h>
 #include <thread>
@@ -7,7 +10,7 @@
 
 #include <libcamera/stream.h>
 
-#include "core/frame_info.hpp"
+//#include "core/frame_info.hpp"
 #include "core/rpicam_app.hpp"
 #include "post_processing_stages/post_processing_stage.hpp"
 
@@ -30,9 +33,9 @@ struct SharedMetadata
 	float exposure_time;
 	float analogue_gain;
 	float digital_gain;
-	unsigned int colorTemp;
-	int64_t ts;
-	float colour_gains[2];
+	unsigned int color_temp;
+	int64_t sensor_timestamp;
+	std::array<float, 2> color_gains;
 	float focus;
 	float fps;
 	bool aelock;
@@ -58,7 +61,16 @@ struct SharedMemoryBuffer
 	SharedMetadata metadata;
 	unsigned int sequence;
 	float framerate;
-	uint8_t stats[23200];
+
+	bool is_recording;
+	bool auto_white_balance;
+	bool raw_reinit;
+	int width;
+	int height;
+	int compression;
+	int thumbnail;
+	int thumbnail_size;
+	std::array<int, 4> raw_crop;
 };
 
 uint64_t getTs()
@@ -87,11 +99,13 @@ private:
 
 	void parseMetaData(libcamera::ControlList &ctrls);
 
-	int segment_id;
 	SharedMemoryBuffer *shared_data;
 	key_t segment_key;
 
 	bool running_ = true;
+
+	CinePIRecorder *_app;
+	RawOptions *_options;
 };
 
 #define NAME "sharedContext"
@@ -105,10 +119,11 @@ void sharedContextStage::Read(boost::property_tree::ptree const &params)
 {
 }
 
-sharedContextStage::sharedContextStage(RPiCamApp *app) : PostProcessingStage(app), shared_data(nullptr)
+sharedContextStage::sharedContextStage(RPiCamApp *app)
+	: PostProcessingStage(app), shared_data(nullptr), _app(static_cast<CinePIRecorder *>(app)),
+	  console(spdlog::stdout_color_mt("sharedContextStage")), _options(_app->GetOptions())
 {
 	// Constructor initialization if needed.
-	console = spdlog::stdout_color_mt("sharedContextStage");
 
 	const int size = sizeof(SharedMemoryBuffer);
 
@@ -183,12 +198,12 @@ bool sharedContextStage::Process(CompletedRequestPtr &completed_request)
 	}
 	shared_data->ts = getTs();
 
-	auto stats = completed_request->metadata.get(libcamera::controls::rpi::PispStatsOutput);
-	if (stats.has_value())
-	{
-		libcamera::Span<const uint8_t> statsSpan = stats.value();
-		std::memcpy(shared_data->stats, statsSpan.data(), statsSpan.size());
-	};
+	// auto stats = completed_request->metadata.get(libcamera::controls::rpi::PispStatsOutput);
+	// if (stats.has_value())
+	// {
+	// 	libcamera::Span<const uint8_t> statsSpan = stats.value();
+	// 	std::memcpy(shared_data->stats, statsSpan.data(), statsSpan.size());
+	// };
 
 	{
 		shared_data->fd_raw = completed_request->buffers[app_->RawStream()]->planes()[0].fd.get();
@@ -199,6 +214,21 @@ bool sharedContextStage::Process(CompletedRequestPtr &completed_request)
 		shared_data->lores_length = completed_request->buffers[app_->LoresStream()]->planes()[0].length;
 		shared_data->framerate = completed_request->framerate;
 		shared_data->sequence = completed_request->sequence;
+
+		shared_data->is_recording = false;
+		shared_data->auto_white_balance = false;
+		shared_data->raw_reinit = false;
+
+		shared_data->width = _options->width;
+		shared_data->height = _options->height;
+
+		shared_data->compression = _options->compression;
+
+		shared_data->thumbnail = _options->thumbnail;
+		shared_data->thumbnail_size = _options->thumbnailSize;
+
+		shared_data->raw_crop = std::array<int, 4>(
+			{ _options->rawCrop[0], _options->rawCrop[1], _options->rawCrop[2], _options->rawCrop[3] });
 		parseMetaData(completed_request->metadata);
 	}
 
@@ -215,12 +245,12 @@ void sharedContextStage::parseMetaData(libcamera::ControlList &ctrls)
 {
 	auto colorT = ctrls.get(libcamera::controls::ColourTemperature);
 	if (colorT)
-		shared_data->metadata.colorTemp = *colorT;
+		shared_data->metadata.color_temp = *colorT;
 
 	auto sts = ctrls.get(libcamera::controls::SensorTimestamp);
 	if (sts)
 	{
-		shared_data->metadata.ts = (*sts);
+		shared_data->metadata.sensor_timestamp = (*sts);
 	}
 
 	auto exp = ctrls.get(libcamera::controls::ExposureTime);
@@ -238,7 +268,7 @@ void sharedContextStage::parseMetaData(libcamera::ControlList &ctrls)
 	auto cg = ctrls.get(libcamera::controls::ColourGains);
 	if (cg)
 	{
-		shared_data->metadata.colour_gains[0] = (*cg)[0], shared_data->metadata.colour_gains[1] = (*cg)[1];
+		shared_data->metadata.color_gains.at(0) = (*cg)[0], shared_data->metadata.color_gains.at(1) = (*cg)[1];
 	}
 
 	auto fom = ctrls.get(libcamera::controls::FocusFoM);
