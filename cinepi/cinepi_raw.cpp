@@ -5,44 +5,46 @@
  * cinepi_raw.cpp - cinepi raw dng recording app.
  */
 
-#include <chrono>
-#include "cinepi_sound.hpp"
 #include "cinepi_controller.hpp"
-
+#include "cinepi_sound.hpp"
 #include "dng_encoder.hpp"
 #include "output/output.hpp"
-#include <spdlog/spdlog.h>
+#include "shared_context_stage.hpp"
+#include <chrono>
 #include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
 
 using namespace std::placeholders;
-
 // The main even loop for the application.
-static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePISound &sound)
+static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePISound &sound, SharedContext &context)
 {
 	controller.start();
 	controller.sync();
 
 	sound.start();
 
-	static auto console = spdlog::stdout_color_mt("event_loop"); 
+	static auto console = spdlog::stdout_color_mt("event_loop");
 
 	RawOptions const *options = app.GetOptions();
 	std::unique_ptr<Output> output = std::unique_ptr<Output>(Output::Create(options));
-	app.SetEncodeOutputReadyCallback(std::bind(&Output::OutputReady, output.get(), _1, _2, _3, _4));
-	app.SetMetadataReadyCallback(std::bind(&Output::MetadataReady, output.get(), _1));
+	app.SetEncodeOutputReadyCallback(std::bind(&Output::OutputReady, output.get(), std::placeholders::_1,
+											   std::placeholders::_2, std::placeholders::_3, std::placeholders::_4));
+	app.SetMetadataReadyCallback(std::bind(&Output::MetadataReady, output.get(), std::placeholders::_1));
 
 	app.OpenCamera();
 	app.StartEncoder();
 	std::vector<std::shared_ptr<libcamera::Camera>> cameras = app.GetCameras();
 	if (cameras.size() == 0)
-    	throw std::runtime_error("no cameras available");
+		throw std::runtime_error("no cameras available");
 	app.GetOptions()->model = app.CameraModel();
 
-	for (unsigned int count = 0; ; count++)
+	for (unsigned int count = 0;; count++)
 	{
-		// if we change the sensor mode, restart the camera. 
-		if(controller.configChanged()){
-			if(controller.cameraRunning){
+		// if we change the sensor mode, restart the camera.
+		if (controller.configChanged())
+		{
+			if (controller.cameraRunning)
+			{
 				app.StopCamera();
 				app.Teardown();
 			}
@@ -51,7 +53,8 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 			controller.cameraRunning = true;
 
 			libcamera::StreamConfiguration const &cfg = app.RawStream()->configuration();
-			console->info("Raw stream: {}x{} : {} : {}", cfg.size.width, cfg.size.height, cfg.stride, cfg.pixelFormat.toString());
+			console->info("Raw stream: {}x{} : {} : {}", cfg.size.width, cfg.size.height, cfg.stride,
+						  cfg.pixelFormat.toString());
 			app.GetEncoder()->reset_encoder();
 			controller.process_stream_info(cfg);
 		}
@@ -77,29 +80,35 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 
 		// parse the frame info metadata for the current frame, publish to redis stats channel
 		controller.process(completed_request);
+		context.process(completed_request, controller);
 
 		// check for record trigger signal, open a new folder if rec_start or reset frame count if _rec_stop
 		int trigger = controller.triggerRec();
-		if(trigger > 0){
+		if (trigger > 0)
+		{
 			controller.folderOpen = create_clip_folder(app.GetOptions(), controller.getClipNumber());
 			app.GetEncoder()->resetFrameCount();
 			sound.record_start();
-		} else if (trigger < 0){
+		}
+		else if (trigger < 0)
+		{
 			controller.folderOpen = false;
 			sound.record_stop();
 		}
 
 		// send frame to dng encoder and save to disk
-		if(controller.isRecording() && sound.isRecording() && controller.folderOpen){
-			// check to make sure our buffer is not full, stop recording if so. 
-			if(app.GetEncoder()->buffer_full()){
+		if (controller.isRecording() && sound.isRecording() && controller.folderOpen)
+		{
+			// check to make sure our buffer is not full, stop recording if so.
+			if (app.GetEncoder()->buffer_full())
+			{
 				controller.setRecording(false);
 			}
 			app.EncodeBuffer(completed_request, app.RawStream(), app.LoresStream());
 		}
 
 		// show frame on display
-		app.ShowPreview(completed_request, app.GetMainStream());       
+		app.ShowPreview(completed_request, app.GetMainStream());
 
 		console->info("Frame Number: {}", count);
 	}
@@ -112,6 +121,7 @@ int main(int argc, char *argv[])
 		CinePIRecorder app;
 		CinePISound sound(&app);
 		CinePIController controller(&app);
+		SharedContext context(&app);
 
 		// libcamera::logSetTarget(libcamera::LoggingTargetNone);
 
@@ -127,7 +137,7 @@ int main(int argc, char *argv[])
 			if (options->verbose >= 2)
 				options->Print();
 
-			event_loop(app, controller, sound);
+			event_loop(app, controller, sound, context);
 		}
 	}
 	catch (std::exception const &e)

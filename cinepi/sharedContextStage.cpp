@@ -1,157 +1,62 @@
-#include "cinepi_recorder.hpp"
 #include "raw_options.hpp"
+#include "shared_context_stage.hpp"
 
-#include <mutex>
-#include <semaphore.h>
-#include <thread>
-#include <time.h>
-#include <unistd.h>
-#include <vector>
+// #include <chrono>
+// #include <mutex>
+// #include <thread>
+// #include <time.h>
+// #include <unistd.h>
+// #include <vector>
 
-#include <libcamera/stream.h>
+// #include <libcamera/stream.h>
 
-//#include "core/frame_info.hpp"
-#include "core/rpicam_app.hpp"
-#include "post_processing_stages/post_processing_stage.hpp"
+// //#include "core/frame_info.hpp"
+// #include "post_processing_stages/post_processing_stage.hpp"
 
-#include <spdlog/sinks/stdout_color_sinks.h>
-#include <spdlog/spdlog.h>
+// #include <spdlog/sinks/stdout_color_sinks.h>
+// #include <spdlog/spdlog.h>
 
 #include <fcntl.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/ipc.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
+// #include <stdio.h>
+// #include <stdlib.h>
+// #include <string.h>
+// #include <sys/ipc.h>
+// #include <sys/mman.h>
+// #include <sys/stat.h>
 
 //#define PROJECT_ID 0x43494E45 // ASCII for "CINE"
-constexpr auto PROJECT_ID = "/CINE";
 
-struct SharedMetadata
-{
-	float exposure_time;
-	float analogue_gain;
-	float digital_gain;
-	unsigned int color_temp;
-	int64_t sensor_timestamp;
-	std::array<float, 2> color_gains;
-	float focus;
-	float fps;
-	bool aelock;
-	float lens_position;
-	int af_state;
-};
-
-struct SharedMemoryBuffer
-{
-	sem_t sem;
-	int fd_raw;
-	int fd_isp;
-	int fd_lores;
-	StreamInfo raw;
-	StreamInfo isp;
-	StreamInfo lores;
-	size_t raw_length;
-	size_t isp_length;
-	size_t lores_length;
-	int procid;
-	uint64_t frame;
-	uint64_t ts;
-	SharedMetadata metadata;
-	unsigned int sequence;
-	float framerate;
-
-	bool is_recording;
-	bool auto_white_balance;
-	bool raw_reinit;
-	int width;
-	int height;
-	int compression;
-	int thumbnail;
-	int thumbnail_size;
-	std::array<int, 4> raw_crop;
-};
-
-uint64_t getTs()
+uint64_t SharedContext::getTs()
 {
 	struct timespec ts;
 	clock_gettime(CLOCK_REALTIME, &ts);
 	return uint64_t(ts.tv_sec * 1000LL + ts.tv_nsec / 1000000);
 }
-
-using Stream = libcamera::Stream;
-
-class sharedContextStage : public PostProcessingStage
+SharedContext::SharedContext(CinePIRecorder *app)
+	: shared_data(nullptr), _app(app), console(spdlog::stdout_color_mt("SharedContext")), _options(_app->GetOptions())
 {
-public:
-	sharedContextStage(RPiCamApp *app);
-	~sharedContextStage();
-
-	char const *Name() const override;
-	void Read(boost::property_tree::ptree const &params) override;
-	void Configure() override;
-	bool Process(CompletedRequestPtr &completed_request) override;
-	void Teardown() override;
-
-private:
-	std::shared_ptr<spdlog::logger> console;
-
-	void parseMetaData(libcamera::ControlList &ctrls);
-
-	SharedMemoryBuffer *shared_data;
-	key_t segment_key;
-
-	bool running_ = true;
-
-	CinePIRecorder *_app;
-	RawOptions *_options;
-};
-
-#define NAME "sharedContext"
-
-char const *sharedContextStage::Name() const
-{
-	return NAME;
-}
-
-void sharedContextStage::Read(boost::property_tree::ptree const &params)
-{
-}
-
-sharedContextStage::sharedContextStage(RPiCamApp *app)
-	: PostProcessingStage(app), shared_data(nullptr), _app(static_cast<CinePIRecorder *>(app)),
-	  console(spdlog::stdout_color_mt("sharedContextStage")), _options(_app->GetOptions())
-{
-	// Constructor initialization if needed.
-
 	const int size = sizeof(SharedMemoryBuffer);
 
-	// Generate a unique key for the shared memory segment
-	// segment_key = ftok("/tmp", PROJECT_ID);
-
-	// Try to obtain an existing segment or create a new one
-	//segment_id = shmget(segment_key, size, IPC_CREAT | S_IRUSR | S_IWUSR);
 	int fd = shm_open(PROJECT_ID, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
 	if (fd == -1)
 	{
-		spdlog::get("sharedContextStage")->error("shm_open failed: {}", errno);
+		spdlog::get("SharedContext")->error("shm_open failed: {}", errno);
 	}
 	if (ftruncate(fd, size) == -1)
 	{
-		spdlog::get("sharedContextStage")->error("fruncate failed: {}", errno);
+		spdlog::get("SharedContext")->error("fruncate failed: {}", errno);
 	}
 
 	// Attach the shared memory segment
 	shared_data = static_cast<SharedMemoryBuffer *>(mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
 	if (shared_data == (void *)-1)
 	{
-		spdlog::get("sharedContextStage")->error("mmap failed: {}", errno);
+		spdlog::get("SharedContext")->error("mmap failed: {}", errno);
 	}
 
 	if (close(fd) == -1)
 	{
-		spdlog::get("sharedContextStage")->error("fclose failed: {}", errno);
+		spdlog::get("SharedContext")->error("fclose failed: {}", errno);
 	}
 	shared_data->fd_raw = -1;
 	shared_data->fd_isp = -1;
@@ -160,98 +65,70 @@ sharedContextStage::sharedContextStage(RPiCamApp *app)
 	shared_data->procid = getpid();
 	shared_data->ts = getTs();
 	sem_init(&shared_data->sem, 1, 1);
-	spdlog::get("sharedContextStage")->info("SharedContextStage created");
+	spdlog::get("SharedContext")->info("SharedContext created");
 }
 
-sharedContextStage::~sharedContextStage()
+SharedContext::~SharedContext()
 {
 	sem_destroy(&shared_data->sem);
 	munmap(shared_data, sizeof(SharedMemoryBuffer));
-	shm_unlink(PROJECT_ID);
-	// 	shmdt(shared_data);
-	// 	shmctl(segment_id, IPC_RMID, NULL);
 }
 
-void sharedContextStage::Teardown()
-{
-	sem_destroy(&shared_data->sem);
-	munmap(shared_data, sizeof(SharedMemoryBuffer));
-	shm_unlink(PROJECT_ID);
-	// shmdt(shared_data);
-	// shmctl(segment_id, IPC_RMID, NULL);
-}
-
-void sharedContextStage::Configure()
-{
-	shared_data->raw = app_->GetStreamInfo(app_->RawStream());
-	shared_data->isp = app_->GetStreamInfo(app_->GetMainStream());
-	shared_data->lores = app_->GetStreamInfo(app_->LoresStream());
-}
-
-#include <chrono>
-
-bool sharedContextStage::Process(CompletedRequestPtr &completed_request)
+void SharedContext::process(CompletedRequestPtr &completed_request, CinePIController &controller)
 {
 	if (sem_wait(&shared_data->sem) == -1)
 	{
-		spdlog::get("sharedContextStage")->error("sem_wait failed: {}", errno);
+		spdlog::get("SharedContext")->error("sem_wait failed: {}", errno);
+		return;
 	}
-	shared_data->ts = getTs();
-
-	// auto stats = completed_request->metadata.get(libcamera::controls::rpi::PispStatsOutput);
-	// if (stats.has_value())
-	// {
-	// 	libcamera::Span<const uint8_t> statsSpan = stats.value();
-	// 	std::memcpy(shared_data->stats, statsSpan.data(), statsSpan.size());
-	// };
-
-	{
-		shared_data->fd_raw = completed_request->buffers[app_->RawStream()]->planes()[0].fd.get();
-		shared_data->fd_isp = completed_request->buffers[app_->GetMainStream()]->planes()[0].fd.get();
-		shared_data->raw_length = completed_request->buffers[app_->RawStream()]->planes()[0].length;
-		shared_data->isp_length = completed_request->buffers[app_->GetMainStream()]->planes()[0].length;
-		shared_data->fd_lores = completed_request->buffers[app_->LoresStream()]->planes()[0].fd.get();
-		shared_data->lores_length = completed_request->buffers[app_->LoresStream()]->planes()[0].length;
-		shared_data->framerate = completed_request->framerate;
-		shared_data->sequence = completed_request->sequence;
-
-		shared_data->is_recording = false;
-		shared_data->auto_white_balance = false;
-		shared_data->raw_reinit = false;
-
-		shared_data->width = _options->width;
-		shared_data->height = _options->height;
-
-		shared_data->compression = _options->compression;
-
-		shared_data->thumbnail = _options->thumbnail;
-		shared_data->thumbnail_size = _options->thumbnailSize;
-
-		shared_data->raw_crop = std::array<int, 4>(
-			{ _options->rawCrop[0], _options->rawCrop[1], _options->rawCrop[2], _options->rawCrop[3] });
-		parseMetaData(completed_request->metadata);
-	}
-
-	shared_data->frame++;
+	readCommands(controller);
+	setInfo(completed_request, controller);
 
 	if (sem_post(&shared_data->sem) == -1)
 	{
-		spdlog::get("sharedContextStage")->error("sem_post failed: {}", errno);
+		spdlog::get("SharedContext")->error("sem_post failed: {}", errno);
+		return;
 	}
-	return false;
+
+	return;
 }
 
-void sharedContextStage::parseMetaData(libcamera::ControlList &ctrls)
+void SharedContext::setInfo(CompletedRequestPtr &completed_request, CinePIController &controller)
 {
+	shared_data->is_recording = controller.isRecording();
+	shared_data->ts = getTs();
+	shared_data->fd_raw = completed_request->buffers[_app->RawStream()]->planes()[0].fd.get();
+	shared_data->fd_isp = completed_request->buffers[_app->GetMainStream()]->planes()[0].fd.get();
+	shared_data->raw_length = completed_request->buffers[_app->RawStream()]->planes()[0].length;
+	shared_data->isp_length = completed_request->buffers[_app->GetMainStream()]->planes()[0].length;
+	shared_data->fd_lores = completed_request->buffers[_app->LoresStream()]->planes()[0].fd.get();
+	shared_data->lores_length = completed_request->buffers[_app->LoresStream()]->planes()[0].length;
+	shared_data->framerate = completed_request->framerate;
+	shared_data->sequence = completed_request->sequence;
+	shared_data->frame++;
+	shared_data->width = _options->width;
+	shared_data->height = _options->height;
+	shared_data->compression = _options->compression;
+	shared_data->thumbnail = _options->thumbnail;
+	shared_data->thumbnail_size = _options->thumbnailSize;
+	shared_data->raw = _app->GetStreamInfo(_app->RawStream());
+	shared_data->isp = _app->GetStreamInfo(_app->GetMainStream());
+	shared_data->lores = _app->GetStreamInfo(_app->LoresStream());
+	shared_data->raw_crop =
+		std::array<int, 4>({ _options->rawCrop[0], _options->rawCrop[1], _options->rawCrop[2], _options->rawCrop[3] });
+	auto ctrls = completed_request->metadata;
+
 	auto colorT = ctrls.get(libcamera::controls::ColourTemperature);
 	if (colorT)
 		shared_data->metadata.color_temp = *colorT;
 
+	auto awb = ctrls.get(libcamera::controls::SensorTimestamp);
+	if (awb)
+		shared_data->auto_white_balance = *awb;
+
 	auto sts = ctrls.get(libcamera::controls::SensorTimestamp);
 	if (sts)
-	{
-		shared_data->metadata.sensor_timestamp = (*sts);
-	}
+		shared_data->metadata.sensor_timestamp = *sts;
 
 	auto exp = ctrls.get(libcamera::controls::ExposureTime);
 	if (exp)
@@ -267,9 +144,7 @@ void sharedContextStage::parseMetaData(libcamera::ControlList &ctrls)
 
 	auto cg = ctrls.get(libcamera::controls::ColourGains);
 	if (cg)
-	{
 		shared_data->metadata.color_gains.at(0) = (*cg)[0], shared_data->metadata.color_gains.at(1) = (*cg)[1];
-	}
 
 	auto fom = ctrls.get(libcamera::controls::FocusFoM);
 	if (fom)
@@ -288,9 +163,84 @@ void sharedContextStage::parseMetaData(libcamera::ControlList &ctrls)
 		shared_data->metadata.af_state = *afs;
 }
 
-static PostProcessingStage *Create(RPiCamApp *app)
+void SharedContext::readCommands(CinePIController &controller)
 {
-	return new sharedContextStage(app);
-}
+	libcamera::ControlList cl;
+	if (shared_data->commands.recording)
+	{
+		bool rec = *(shared_data->commands.auto_white_balance);
+		int trig = rec ? 1 : -1;
+		controller.setTrigger(trig);
+		controller.setRecording(rec);
+		shared_data->commands.recording = std::nullopt;
+	}
+	if (shared_data->commands.auto_white_balance)
+	{
+		cl.set(libcamera::controls::AwbEnable, *(shared_data->commands.auto_white_balance));
+		shared_data->commands.auto_white_balance = std::nullopt;
+	}
+	if (shared_data->commands.reinitialize)
+	{
+		controller.setInit();
+		shared_data->commands.reinitialize = std::nullopt;
+	}
+	if (shared_data->commands.width)
+	{
+		_options->width = *(shared_data->commands.width);
+		shared_data->commands.width = std::nullopt;
+	}
+	if (shared_data->commands.height)
+	{
+		_options->height = *(shared_data->commands.height);
+		shared_data->commands.height = std::nullopt;
+	}
+	if (shared_data->commands.compression)
+	{
+		_options->compression = *(shared_data->commands.compression);
+		shared_data->commands.compression = std::nullopt;
+	}
+	if (shared_data->commands.thumbnail)
+	{
+		_options->thumbnail = *(shared_data->commands.thumbnail);
 
-static RegisterStage reg(NAME, &Create);
+		controller.setInit();
+
+		shared_data->commands.thumbnail = std::nullopt;
+	}
+	if (shared_data->commands.thumbnail_size)
+	{
+		_options->thumbnailSize = *(shared_data->commands.thumbnail_size);
+		controller.setInit();
+		shared_data->commands.thumbnail_size = std::nullopt;
+	}
+	if (shared_data->commands.raw_crop)
+	{
+		_options->rawCrop[0] = shared_data->commands.raw_crop.value().at(0);
+		_options->rawCrop[1] = shared_data->commands.raw_crop.value().at(1);
+		_options->rawCrop[2] = shared_data->commands.raw_crop.value().at(2);
+		_options->rawCrop[3] = shared_data->commands.raw_crop.value().at(3);
+		shared_data->commands.auto_white_balance = std::nullopt;
+	}
+	if (shared_data->commands.framerate)
+	{
+		_options->framerate = *(shared_data->commands.framerate);
+		//TODO: implement solution from cinepi_controller
+		shared_data->commands.framerate = std::nullopt;
+	};
+	if (shared_data->commands.iso)
+	{
+		cl.set(libcamera::controls::AnalogueGain, *(shared_data->commands.iso));
+		shared_data->commands.iso = std::nullopt;
+	};
+	if (shared_data->commands.shutter_speed)
+	{
+		cl.set(libcamera::controls::ExposureTime, *(shared_data->commands.shutter_speed));
+		shared_data->commands.shutter_speed = std::nullopt;
+	};
+	if (shared_data->commands.color_gains)
+	{
+		cl.set(libcamera::controls::ColourGains, *(shared_data->commands.color_gains));
+		shared_data->commands.color_gains = std::nullopt;
+	};
+	_app->SetControls(cl);
+}
