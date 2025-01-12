@@ -58,12 +58,12 @@ SharedContext::SharedContext(CinePIRecorder *app)
 	{
 		spdlog::get("SharedContext")->error("fclose failed: {}", errno);
 	}
-	shared_data->fd_raw = -1;
-	shared_data->fd_isp = -1;
-	shared_data->fd_lores = -1;
-	shared_data->frame = 0;
-	shared_data->procid = getpid();
-	shared_data->ts = getTs();
+	shared_data->info.fd_raw = -1;
+	shared_data->info.fd_isp = -1;
+	shared_data->info.fd_lores = -1;
+	shared_data->info.frame = 0;
+	shared_data->info.procid = getpid();
+	shared_data->info.ts = getTs();
 	sem_init(&shared_data->sem, 1, 1);
 	spdlog::get("SharedContext")->info("SharedContext created");
 }
@@ -81,8 +81,10 @@ void SharedContext::process(CompletedRequestPtr &completed_request, CinePIContro
 		spdlog::get("SharedContext")->error("sem_wait failed: {}", errno);
 		return;
 	}
+
 	readCommands(controller);
 	setInfo(completed_request, controller);
+	setMetadata(completed_request->metadata);
 
 	if (sem_post(&shared_data->sem) == -1)
 	{
@@ -95,89 +97,100 @@ void SharedContext::process(CompletedRequestPtr &completed_request, CinePIContro
 
 void SharedContext::setInfo(CompletedRequestPtr &completed_request, CinePIController &controller)
 {
-	shared_data->is_recording = controller.isRecording();
-	shared_data->ts = getTs();
-	shared_data->fd_raw = completed_request->buffers[_app->RawStream()]->planes()[0].fd.get();
-	shared_data->fd_isp = completed_request->buffers[_app->GetMainStream()]->planes()[0].fd.get();
-	shared_data->raw_length = completed_request->buffers[_app->RawStream()]->planes()[0].length;
-	shared_data->isp_length = completed_request->buffers[_app->GetMainStream()]->planes()[0].length;
-	shared_data->fd_lores = completed_request->buffers[_app->LoresStream()]->planes()[0].fd.get();
-	shared_data->lores_length = completed_request->buffers[_app->LoresStream()]->planes()[0].length;
-	shared_data->framerate = completed_request->framerate;
-	shared_data->sequence = completed_request->sequence;
-	shared_data->frame++;
-	shared_data->width = _options->width;
-	shared_data->height = _options->height;
-	shared_data->compression = _options->compression;
-	shared_data->thumbnail = _options->thumbnail;
-	shared_data->thumbnail_size = _options->thumbnailSize;
+	shared_data->info.is_recording = controller.isRecording();
+	shared_data->info.ts = getTs();
+	shared_data->info.fd_raw = completed_request->buffers[_app->RawStream()]->planes()[0].fd.get();
+	shared_data->info.fd_isp = completed_request->buffers[_app->GetMainStream()]->planes()[0].fd.get();
+	shared_data->info.fd_lores = completed_request->buffers[_app->LoresStream()]->planes()[0].fd.get();
+	shared_data->info.raw_length = completed_request->buffers[_app->RawStream()]->planes()[0].length;
+	shared_data->info.isp_length = completed_request->buffers[_app->GetMainStream()]->planes()[0].length;
+	shared_data->info.lores_length = completed_request->buffers[_app->LoresStream()]->planes()[0].length;
+	shared_data->info.framerate = completed_request->framerate;
+	shared_data->info.sequence = completed_request->sequence;
+	shared_data->info.frame++;
+	shared_data->info.width = _options->width;
+	shared_data->info.height = _options->height;
+	shared_data->info.compression = _options->compression;
+	shared_data->info.thumbnail = _options->thumbnail;
+	shared_data->info.thumbnail_size = _options->thumbnailSize;
+	shared_data->info.raw_crop =
+		std::array<int, 4>({ _options->rawCrop[0], _options->rawCrop[1], _options->rawCrop[2], _options->rawCrop[3] });
 	shared_data->raw = _app->GetStreamInfo(_app->RawStream());
 	shared_data->isp = _app->GetStreamInfo(_app->GetMainStream());
 	shared_data->lores = _app->GetStreamInfo(_app->LoresStream());
-	shared_data->raw_crop =
-		std::array<int, 4>({ _options->rawCrop[0], _options->rawCrop[1], _options->rawCrop[2], _options->rawCrop[3] });
-	auto ctrls = completed_request->metadata;
+}
 
-	auto colorT = ctrls.get(libcamera::controls::ColourTemperature);
-	if (colorT)
-		shared_data->metadata.color_temp = *colorT;
-
-	auto awb = ctrls.get(libcamera::controls::SensorTimestamp);
-	if (awb)
-		shared_data->auto_white_balance = *awb;
-
-	auto sts = ctrls.get(libcamera::controls::SensorTimestamp);
-	if (sts)
-		shared_data->metadata.sensor_timestamp = *sts;
-
-	auto exp = ctrls.get(libcamera::controls::ExposureTime);
-	if (exp)
-		shared_data->metadata.exposure_time = *exp;
-
-	auto ag = ctrls.get(libcamera::controls::AnalogueGain);
-	if (ag)
-		shared_data->metadata.analogue_gain = *ag;
-
-	auto dg = ctrls.get(libcamera::controls::DigitalGain);
-	if (dg)
-		shared_data->metadata.digital_gain = *dg;
-
-	auto cg = ctrls.get(libcamera::controls::ColourGains);
-	if (cg)
-		shared_data->metadata.color_gains.at(0) = (*cg)[0], shared_data->metadata.color_gains.at(1) = (*cg)[1];
-
-	auto fom = ctrls.get(libcamera::controls::FocusFoM);
-	if (fom)
-		shared_data->metadata.focus = *fom;
-
-	auto ae = ctrls.get(libcamera::controls::AeLocked);
-	if (ae)
-		shared_data->metadata.aelock = *ae;
-
-	auto lp = ctrls.get(libcamera::controls::LensPosition);
-	if (lp)
-		shared_data->metadata.lens_position = *lp;
-
-	auto afs = ctrls.get(libcamera::controls::AfState);
-	if (afs)
-		shared_data->metadata.af_state = *afs;
+void SharedContext::setMetadata(libcamera::ControlList &cl)
+{
+	_setMetadataValue(cl, libcamera::controls::AeConstraintMode, shared_data->metadata.ae_constraint_mode);
+	_setMetadataValue(cl, libcamera::controls::AeEnable, shared_data->metadata.ae_enable);
+	_setMetadataValue(cl, libcamera::controls::AeExposureMode, shared_data->metadata.ae_exposure_mode);
+	_setMetadataValue(cl, libcamera::controls::AeFlickerDetected, shared_data->metadata.ae_flicker_detected);
+	_setMetadataValue(cl, libcamera::controls::AeFlickerMode, shared_data->metadata.ae_flicker_mode);
+	_setMetadataValue(cl, libcamera::controls::AeFlickerPeriod, shared_data->metadata.ae_flicker_period);
+	_setMetadataValue(cl, libcamera::controls::AeLocked, shared_data->metadata.ae_locked);
+	_setMetadataValue(cl, libcamera::controls::AeMeteringMode, shared_data->metadata.ae_metering_mode);
+	_setMetadataValue(cl, libcamera::controls::AnalogueGain, shared_data->metadata.analogue_gain);
+	_setMetadataValue(cl, libcamera::controls::AwbEnable, shared_data->metadata.awb_enable);
+	_setMetadataValue(cl, libcamera::controls::AwbLocked, shared_data->metadata.awb_locked);
+	_setMetadataValue(cl, libcamera::controls::AwbMode, shared_data->metadata.awb_mode);
+	_setMetadataValue(cl, libcamera::controls::Brightness, shared_data->metadata.brightness);
+	// _setMetadataValue(cl, libcamera::controls::ColourGains, shared_data->metadata.color_gains); //
+	auto color_gains_value = cl.get(libcamera::controls::ColourGains);
+	if (color_gains_value)
+	{
+		std::array<float, 2> new_value = { (*color_gains_value)[0], (*color_gains_value)[1] };
+		shared_data->metadata.color_gains = new_value;
+	}
+	_setMetadataValue(cl, libcamera::controls::ColourTemperature, shared_data->metadata.color_temperature);
+	_setMetadataValue(cl, libcamera::controls::Contrast, shared_data->metadata.contrast);
+	_setMetadataValue(cl, libcamera::controls::DigitalGain, shared_data->metadata.digital_gain);
+	_setMetadataValue(cl, libcamera::controls::ExposureTime, shared_data->metadata.exposure_time);
+	_setMetadataValue(cl, libcamera::controls::ExposureValue, shared_data->metadata.exposure_value);
+	_setMetadataValue(cl, libcamera::controls::FrameDuration, shared_data->metadata.frame_duration);
+	// _setMetadataValue(cl, libcamera::controls::FrameDurationLimits, shared_data->metadata.frame_duration_limits); //
+	auto frame_duration_limits_value = cl.get(libcamera::controls::ColourGains);
+	if (frame_duration_limits_value)
+	{
+		std::array<int, 2> new_value = { (*frame_duration_limits_value)[0], (*frame_duration_limits_value)[1] };
+		shared_data->metadata.frame_duration_limits = new_value;
+	}
+	_setMetadataValue(cl, libcamera::controls::Gamma, shared_data->metadata.gamma);
+	_setMetadataValue(cl, libcamera::controls::LensPosition, shared_data->metadata.lens_position);
+	_setMetadataValue(cl, libcamera::controls::Lux, shared_data->metadata.lux); //
+	_setMetadataValue(cl, libcamera::controls::Saturation, shared_data->metadata.saturation);
+	_setMetadataValue(cl, libcamera::controls::Sharpness, shared_data->metadata.sharpness);
 }
 
 void SharedContext::readCommands(CinePIController &controller)
 {
 	libcamera::ControlList cl;
-	if (shared_data->commands.recording)
+	_setCommand(cl, shared_data->commands.ae_constraint_mode, libcamera::controls::AeConstraintMode);
+	_setCommand(cl, shared_data->commands.ae_enable, libcamera::controls::AeEnable);
+	_setCommand(cl, shared_data->commands.ae_exposure_mode, libcamera::controls::AeExposureMode);
+	_setCommand(cl, shared_data->commands.ae_flicker_mode, libcamera::controls::AeFlickerMode);
+	_setCommand(cl, shared_data->commands.ae_flicker_period, libcamera::controls::AeFlickerPeriod);
+	_setCommand(cl, shared_data->commands.ae_metering_mode, libcamera::controls::AeMeteringMode);
+	_setCommand(cl, shared_data->commands.analogue_gain, libcamera::controls::AnalogueGain);
+	_setCommand(cl, shared_data->commands.awb_enable, libcamera::controls::AwbEnable);
+	_setCommand(cl, shared_data->commands.awb_mode, libcamera::controls::AwbMode);
+	_setCommand(cl, shared_data->commands.brightness, libcamera::controls::Brightness);
+	_setCommand(cl, shared_data->commands.color_gains, libcamera::controls::ColourGains);
+	_setCommand(cl, shared_data->commands.color_temperature, libcamera::controls::ColourTemperature);
+	_setCommand(cl, shared_data->commands.contrast, libcamera::controls::Contrast);
+	_setCommand(cl, shared_data->commands.exposure_time, libcamera::controls::ExposureTime);
+	_setCommand(cl, shared_data->commands.exposure_value, libcamera::controls::ExposureValue);
+	_setCommand(cl, shared_data->commands.frame_duration_limits, libcamera::controls::FrameDurationLimits);
+	_setCommand(cl, shared_data->commands.gamma, libcamera::controls::Gamma);
+	_setCommand(cl, shared_data->commands.saturation, libcamera::controls::Saturation);
+	_setCommand(cl, shared_data->commands.sharpness, libcamera::controls::Sharpness);
+	if (shared_data->commands.set_recording)
 	{
-		bool rec = *(shared_data->commands.auto_white_balance);
+		bool rec = *(shared_data->commands.set_recording);
 		int trig = rec ? 1 : -1;
 		controller.setTrigger(trig);
 		controller.setRecording(rec);
-		shared_data->commands.recording = std::nullopt;
-	}
-	if (shared_data->commands.auto_white_balance)
-	{
-		cl.set(libcamera::controls::AwbEnable, *(shared_data->commands.auto_white_balance));
-		shared_data->commands.auto_white_balance = std::nullopt;
+		shared_data->commands.set_recording = std::nullopt;
 	}
 	if (shared_data->commands.reinitialize)
 	{
@@ -202,15 +215,11 @@ void SharedContext::readCommands(CinePIController &controller)
 	if (shared_data->commands.thumbnail)
 	{
 		_options->thumbnail = *(shared_data->commands.thumbnail);
-
-		controller.setInit();
-
 		shared_data->commands.thumbnail = std::nullopt;
 	}
 	if (shared_data->commands.thumbnail_size)
 	{
 		_options->thumbnailSize = *(shared_data->commands.thumbnail_size);
-		controller.setInit();
 		shared_data->commands.thumbnail_size = std::nullopt;
 	}
 	if (shared_data->commands.raw_crop)
@@ -219,28 +228,7 @@ void SharedContext::readCommands(CinePIController &controller)
 		_options->rawCrop[1] = shared_data->commands.raw_crop.value().at(1);
 		_options->rawCrop[2] = shared_data->commands.raw_crop.value().at(2);
 		_options->rawCrop[3] = shared_data->commands.raw_crop.value().at(3);
-		shared_data->commands.auto_white_balance = std::nullopt;
+		shared_data->commands.raw_crop = std::nullopt;
 	}
-	if (shared_data->commands.framerate)
-	{
-		_options->framerate = *(shared_data->commands.framerate);
-		//TODO: implement solution from cinepi_controller
-		shared_data->commands.framerate = std::nullopt;
-	};
-	if (shared_data->commands.iso)
-	{
-		cl.set(libcamera::controls::AnalogueGain, *(shared_data->commands.iso));
-		shared_data->commands.iso = std::nullopt;
-	};
-	if (shared_data->commands.shutter_speed)
-	{
-		cl.set(libcamera::controls::ExposureTime, *(shared_data->commands.shutter_speed));
-		shared_data->commands.shutter_speed = std::nullopt;
-	};
-	if (shared_data->commands.color_gains)
-	{
-		cl.set(libcamera::controls::ColourGains, *(shared_data->commands.color_gains));
-		shared_data->commands.color_gains = std::nullopt;
-	};
 	_app->SetControls(cl);
 }
