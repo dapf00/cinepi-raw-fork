@@ -6,7 +6,7 @@ project('rpicam-apps', 'c', 'cpp',
             'warning_level=3',
             'cpp_std=c++17',
             'c_std=c11',
-            'buildtype=release',
+	    'buildtype=release',
         ],
         license : 'BSD-2-Clause')
 
