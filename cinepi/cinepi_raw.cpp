@@ -86,12 +86,20 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 		int trigger = controller.triggerRec();
 		if (trigger > 0)
 		{
-			controller.folderOpen = create_clip_folder(app.GetOptions(), controller.getClipNumber());
+			console->info("in trigger_rec");
+			RawOptions *options = app.GetOptions();
+			console->info("after get options");
+			unsigned int clipNo = controller.getClipNumber();
+			console->info("after get clipno");
+			controller.folderOpen = create_clip_folder(options, clipNo);
+			console->info("after folder open");
 			app.GetEncoder()->resetFrameCount();
+			console->info("after reset framecount open");
 			sound.record_start();
 		}
 		else if (trigger < 0)
 		{
+			console->info("trigger 0");
 			controller.folderOpen = false;
 			sound.record_stop();
 		}
@@ -99,9 +107,11 @@ static void event_loop(CinePIRecorder &app, CinePIController &controller, CinePI
 		// send frame to dng encoder and save to disk
 		if (controller.isRecording() && sound.isRecording() && controller.folderOpen)
 		{
+			console->info("in controller is recoring");
 			// check to make sure our buffer is not full, stop recording if so.
 			if (app.GetEncoder()->buffer_full())
 			{
+				console->info("buffer full");
 				controller.setRecording(false);
 			}
 			app.EncodeBuffer(completed_request, app.RawStream(), app.LoresStream());

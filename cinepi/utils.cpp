@@ -1,31 +1,38 @@
 #include "utils.hpp"
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
 
-bool is_mounted(const char *mount_point) {
-    FILE *fp = fopen("/proc/mounts", "r");
-    if (fp == NULL) {
-        perror("Error opening /proc/mounts");
-        return false;
-    }
+bool is_mounted(const char *mount_point)
+{
+	FILE *fp = fopen("/proc/mounts", "r");
+	if (fp == NULL)
+	{
+		perror("Error opening /proc/mounts");
+		return false;
+	}
 
-    char *line = NULL;
-    size_t len = 0;
-    ssize_t read;
-    bool found = false;
+	char *line = NULL;
+	size_t len = 0;
+	ssize_t read;
+	bool found = false;
 
-    while ((read = getline(&line, &len, fp)) != -1) {
-        if (strstr(line, mount_point) != NULL) {
-            found = true;
-            break;
-        }
-    }
+	while ((read = getline(&line, &len, fp)) != -1)
+	{
+		if (strstr(line, mount_point) != NULL)
+		{
+			found = true;
+			break;
+		}
+	}
 
-    free(line);
-    fclose(fp);
+	free(line);
+	fclose(fp);
 
-    return found;
+	return found;
 }
 
-bool disk_mounted(RawOptions const *options){
+bool disk_mounted(RawOptions const *options)
+{
 	return fs::exists(fs::path(options->mediaDest)) && is_mounted(options->mediaDest.c_str());
 }
 
@@ -43,52 +50,70 @@ void generate_filename(RawOptions *options, unsigned int clip_number)
 
 bool create_clip_folder(RawOptions *options, unsigned int clip_number)
 {
-	if(!disk_mounted(options))
+	auto console = spdlog::stdout_color_mt("create clip");
+	console->info("in create_clip_folder");
+	if (!disk_mounted(options))
 		return false;
 	generate_filename(options, clip_number);
-	return fs::create_directories(options->mediaDest + std::string("/") + options->folder);
-}
+	console->info("after_generate_filename");
+	std::error_code ec;
+	bool success = fs::create_directories(options->mediaDest + "/" + options->folder, ec);
+	if (!success)
+	{
+		std::cerr << "Failed to create directories: " << ec.message() << std::endl;
+	}
+	else
+	{
+		std::cout << "Directories created successfully." << std::endl;
+	}
 
+	return success;
+}
 
 bool create_stills_folder(RawOptions *options, unsigned int still_number)
 {
-	if(!disk_mounted(options))
+	if (!disk_mounted(options))
 		return false;
 	std::string stillsPath = options->mediaDest + std::string("/stills");
 	bool exists = fs::exists(fs::path(stillsPath));
 	generate_filename(options, still_number);
-	if(!exists){
+	if (!exists)
+	{
 		return fs::create_directories(options->mediaDest + std::string("/stills"));
 	}
 	return exists;
 }
 
+std::string getHwId()
+{
+	std::ifstream cpuinfo("/proc/cpuinfo");
+	std::string line;
+	std::string serialTag = "Serial";
 
-std::string getHwId() {
-    std::ifstream cpuinfo("/proc/cpuinfo");
-    std::string line;
-    std::string serialTag = "Serial";
-    
-    while (std::getline(cpuinfo, line)) {
-        if (line.find(serialTag) != std::string::npos) {
-            std::string serial = line.substr(line.find(":") + 1);
-            // Remove leading and trailing whitespace
-            size_t start = serial.find_first_not_of(" \t");
-            size_t end = serial.find_last_not_of(" \t");
-            if (start != std::string::npos) {
-                return serial.substr(start, end - start + 1);
-            }
-        }
-    }
-    cpuinfo.close();
+	while (std::getline(cpuinfo, line))
+	{
+		if (line.find(serialTag) != std::string::npos)
+		{
+			std::string serial = line.substr(line.find(":") + 1);
+			// Remove leading and trailing whitespace
+			size_t start = serial.find_first_not_of(" \t");
+			size_t end = serial.find_last_not_of(" \t");
+			if (start != std::string::npos)
+			{
+				return serial.substr(start, end - start + 1);
+			}
+		}
+	}
+	cpuinfo.close();
 
-    // Fallback to MAC address
-    std::ifstream macFile("/sys/class/net/eth0/address");
-    if (macFile.is_open()) {
-        std::getline(macFile, line);
-        macFile.close();
-        return line;
-    }
+	// Fallback to MAC address
+	std::ifstream macFile("/sys/class/net/eth0/address");
+	if (macFile.is_open())
+	{
+		std::getline(macFile, line);
+		macFile.close();
+		return line;
+	}
 
-    return "UNKNOWN"; // As a final fallback
+	return "UNKNOWN"; // As a final fallback
 }

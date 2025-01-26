@@ -40,7 +40,8 @@ public:
 	{
 		assert(encoder_);
 
-		if(!encoder_->initialized()){
+		if (!encoder_->initialized())
+		{
 			libcamera::StreamConfiguration const &cfg = stream->configuration();
 			libcamera::StreamConfiguration const &lo_cfg = lostream->configuration();
 			encoder_->setup_encoder(cfg, lo_cfg, completed_request->metadata);
@@ -63,19 +64,20 @@ public:
 			*(ptr++) >>= 4;
 
 		auto main_image_end = std::chrono::high_resolution_clock::now();
-        auto main_image_duration = std::chrono::duration_cast<std::chrono::milliseconds>(main_image_end - main_image_start).count();
+		auto main_image_duration =
+			std::chrono::duration_cast<std::chrono::milliseconds>(main_image_end - main_image_start).count();
 
-        LOG(1,"main image written to dng: " << main_image_duration << "ms");
+		LOG(1, "main image written to dng: " << main_image_duration << "ms");
 
 		BufferReadSync r2(this, completed_request->buffers[lostream]);
 		const std::vector<libcamera::Span<uint8_t>> lomem = r2.Get();
-		
+
 		if (!mem[0].data())
 			throw std::runtime_error("no buffer to encode");
 
 		if (!lomem[0].data())
 			throw std::runtime_error("no buffer to encode, thumbnail");
-			
+
 		auto ts = completed_request->metadata.get(controls::SensorTimestamp);
 		int64_t timestamp_ns = ts ? *ts : buffer->metadata().timestamp;
 		encoder_->log_ts(timestamp_ns);
@@ -83,21 +85,19 @@ public:
 			std::lock_guard<std::mutex> lock(encode_buffer_queue_mutex_);
 			encode_buffer_queue_.push(completed_request); // creates a new reference
 		}
-		encoder_->EncodeBuffer2(buffer->planes()[0].fd.get(), mem[0].size(), (void *)mem[0].data(), info, lomem[0].size(), (void *)lomem[0].data(), loinfo, timestamp_ns / 1000, completed_request->metadata);
+		encoder_->EncodeBuffer2(buffer->planes()[0].fd.get(), mem[0].size(), (void *)mem[0].data(), info,
+								lomem[0].size(), (void *)lomem[0].data(), loinfo, timestamp_ns / 1000,
+								completed_request->metadata);
 	}
 	RawOptions *GetOptions() const { return static_cast<RawOptions *>(options_.get()); }
 	DngEncoder *GetEncoder() { return encoder_.get(); }
 	void StopEncoder() { encoder_.reset(); }
 
 protected:
-	virtual void createEncoder()
-	{
-		encoder_ = std::unique_ptr<DngEncoder>(new DngEncoder(GetOptions()));
-	}
+	virtual void createEncoder() { encoder_ = std::unique_ptr<DngEncoder>(new DngEncoder(GetOptions())); }
 	std::unique_ptr<DngEncoder> encoder_;
 
 private:
-
 	void encodeBufferDone(void *mem)
 	{
 		// If non-NULL, mem would indicate which buffer has been completed, but
